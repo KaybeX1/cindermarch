@@ -1,0 +1,59 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
+<meta name="theme-color" content="#0d0b0a">
+<title>Cindermarch</title>
+<link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+<canvas id="cv"></canvas>
+
+<div id="hud" class="hidden">
+  <div id="top">
+    <div id="zonebox">
+      <div id="zname"></div>
+      <div class="bar" id="zbar"><i></i><span id="ztxt"></span></div>
+    </div>
+    <div id="gold"></div>
+  </div>
+  <div id="bossbar" class="hidden"><div id="bname"></div><div class="bar"><i></i></div></div>
+  <div id="btns">
+    <button data-p="inv" aria-label="Inventory">🎒<b id="dotInv"></b></button>
+    <button data-p="gems" aria-label="Skills">💎<b id="dotGems"></b></button>
+    <button data-p="tree" aria-label="Passive tree">🌳<b id="dotTree"></b></button>
+    <button data-p="menu" aria-label="Menu">☰</button>
+  </div>
+  <div id="toasts"></div>
+  <div id="bottom">
+    <div id="orb"><i id="orbfill"></i><span id="orbtxt"></span></div>
+    <div id="skills"></div>
+    <div id="lvl"></div>
+  </div>
+  <div id="xpbar"><i></i></div>
+</div>
+
+<div id="panel" class="hidden">
+  <div id="phead">
+    <div id="tabs">
+      <button data-p="inv">Items</button>
+      <button data-p="gems">Skills</button>
+      <button data-p="tree">Passives</button>
+      <button data-p="menu">Menu</button>
+    </div>
+    <button id="pclose" aria-label="Close">✕</button>
+  </div>
+  <div id="pbody"></div>
+  <div id="sheet" class="hidden"></div>
+</div>
+
+<div id="overlay" class="hidden"></div>
+
+<script src="js/data.js"></script>
+<script src="js/tree.js"></script>
+<script src="js/game.js"></script>
+<script src="js/render.js"></script>
+<script src="js/ui.js"></script>
+</body>
+</html>

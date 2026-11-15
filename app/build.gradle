@@ -1,0 +1,44 @@
+plugins {
+    id 'com.android.application'
+}
+
+// The same key signs every build, so a new APK installs over the old one and keeps the save.
+def sharedKey = rootProject.file('keystore/debug.keystore')
+def runNumber = System.getenv('GITHUB_RUN_NUMBER') ?: '1'
+
+android {
+    namespace 'com.kaybex.cindermarch'
+    compileSdk 34
+
+    defaultConfig {
+        applicationId 'com.kaybex.cindermarch'
+        minSdk 26
+        targetSdk 34
+        versionCode runNumber.toInteger()
+        versionName "0.1.${runNumber}"
+    }
+    signingConfigs {
+        shared {
+            if (sharedKey.exists()) {
+                storeFile sharedKey
+                storePassword 'android'
+                keyAlias 'androiddebugkey'
+                keyPassword 'android'
+            }
+        }
+    }
+    buildTypes {
+        debug {
+            if (sharedKey.exists()) {
+                signingConfig signingConfigs.shared
+            }
+        }
+    }
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+    lint {
+        abortOnError false
+    }
+}
