@@ -36,7 +36,19 @@ jobs:
       - name: Restore signing key
         run: base64 -d keystore/debug.keystore.b64 > keystore/debug.keystore
 
+      - name: Pick version
+        id: ver
+        run: |
+          # 1.0.0 for the first published build, then +0.0.1 after each one that succeeded.
+          last=$(gh release list --limit 200 --json tagName --jq '.[].tagName' | grep -E '^v1\.0\.[0-9]+$' | sed 's/^v1\.0\.//' | sort -n | tail -1 || true)
+          if [ -z "$last" ]; then next=0; else next=$((last + 1)); fi
+          echo "name=1.0.$next" >> "$GITHUB_OUTPUT"
+          echo "Building version 1.0.$next"
+
       - name: Build
+        env:
+          VERSION_NAME: ${{ steps.ver.outputs.name }}
+          UPDATE_TOKEN: ${{ secrets.UPDATE_TOKEN }}
         run: |
           set -o pipefail
           gradle assembleDebug --no-daemon --stacktrace 2>&1 | tee build.log
@@ -44,10 +56,14 @@ jobs:
       - name: Publish release
         run: |
           cp app/build/outputs/apk/debug/app-debug.apk Cindermarch.apk
-          gh release create "v0.1.${{ github.run_number }}" Cindermarch.apk \
-            --title "Cindermarch 0.1.${{ github.run_number }}" \
+          gh release create "v${{ steps.ver.outputs.name }}" Cindermarch.apk \
+            --title "Cindermarch ${{ steps.ver.outputs.name }}" \
             --notes "Automatic build of ${{ github.sha }}. Download Cindermarch.apk on your phone and open it to install." \
             --latest
+          # Remove the test builds made before versioning started at 1.0.0.
+          for old in $(gh release list --limit 200 --json tagName --jq '.[].tagName' | grep -E '^v0\.' || true); do
+            gh release delete "$old" --cleanup-tag --yes || true
+          done
 
       - name: Report failure
         if: failure()

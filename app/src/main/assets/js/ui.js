@@ -301,7 +301,7 @@ function renderMenu() {
   h += '<h3>Record</h3><div class="stats"><div>Level<b>' + S.level + '</b></div><div>Monsters slain<b>' + fmt(S.stats.kills) + '</b></div><div>Deaths<b>' + S.stats.deaths + '</b></div><div>Gold<b>' + fmt(S.gold) + '</b></div></div>';
   h += '<h3>How to play</h3><div style="font-size:12.5px;color:var(--dim)">Drag anywhere to move. Skills fire by themselves whenever an enemy is in range. Kill enough monsters and the zone boss appears; beat it and step into the portal for a harder zone.<br><br>Power comes from three places: <b style="color:var(--text)">items</b> with random modifiers, <b style="color:var(--text)">skill gems</b> linked to support gems that change how they behave, and the <b style="color:var(--text)">passive tree</b> (one point per level).</div>';
   h += '<h3>Game</h3><div class="row"><button class="btn danger" data-act="reset">Start a new character</button></div>';
-  h += '<div style="margin-top:18px;font-size:11px;color:#5a5248">Cindermarch · saves automatically on this device</div>';
+  h += '<div style="margin-top:18px;font-size:11px;color:#5a5248">Cindermarch' + (window.Android && Android.version ? ' ' + esc(Android.version()) : '') + ' · saves automatically on this device</div>';
   el.pbody.innerHTML = h;
 }
 
@@ -353,6 +353,7 @@ function showStart() {
     '<div style="margin-bottom:10px">Choose your first skill</div><div class="starters">' +
     ['arc', 'bolt', 'chain'].map(id => '<button class="starter" data-start="' + id + '"><span class="ic">' + SKILLS[id].icon + '</span><span><b>' + SKILLS[id].name + '</b><span>' + SKILLS[id].desc + '</span></span></button>').join('') + '</div>';
 }
+window.pauseForNative = () => { if (G && S && !G.dead && !paused) openPanel('menu'); };
 window.onAndroidBack = () => {
   if (!el.sheet.classList.contains('hidden')) { closeSheet(); return true; }
   if (!el.panel.classList.contains('hidden')) { closePanel(); return true; }

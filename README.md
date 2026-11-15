@@ -14,6 +14,12 @@ Každá změna ve větvi `main` spustí GitHub Actions, které sestaví APK a vy
 Otevři v telefonu záložku Releases, stáhni `Cindermarch.apk` a nainstaluj (Android 8.0+).
 Všechna sestavení jsou podepsaná stejným klíčem, takže nová verze se nainstaluje přes starou a uložená hra zůstane.
 
+## Verze a aktualizace
+
+První vydání je 1.0.0 a každé další úspěšné sestavení zvýší verzi o 0.0.1.
+Hra při spuštění zkontroluje poslední vydání na GitHubu, novější APK si stáhne a nabídne instalaci.
+Dokud je repozitář soukromý, potřebuje k tomu token jen pro čtení uložený jako secret `UPDATE_TOKEN`; u veřejného repozitáře není potřeba nic.
+
 ## Struktura
 
 - `app/src/main/assets/` – samotná hra (HTML, CSS, JavaScript), jde otevřít i v prohlížeči

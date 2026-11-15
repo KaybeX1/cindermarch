@@ -5,6 +5,11 @@ plugins {
 // The same key signs every build, so a new APK installs over the old one and keeps the save.
 def sharedKey = rootProject.file('keystore/debug.keystore')
 def runNumber = System.getenv('GITHUB_RUN_NUMBER') ?: '1'
+// The build workflow picks the version: 1.0.0 first, then +0.0.1 for every published build.
+def appVersion = System.getenv('VERSION_NAME') ?: '1.0.0-dev'
+def updateRepo = System.getenv('GITHUB_REPOSITORY') ?: 'KaybeX1/cindermarch'
+// Only needed while the repository is private; empty means the updater asks GitHub anonymously.
+def updateToken = System.getenv('UPDATE_TOKEN') ?: ''
 
 android {
     namespace 'com.kaybex.cindermarch'
@@ -15,7 +20,9 @@ android {
         minSdk 26
         targetSdk 34
         versionCode runNumber.toInteger()
-        versionName "0.1.${runNumber}"
+        versionName appVersion
+        buildConfigField 'String', 'UPDATE_REPO', "\"${updateRepo}\""
+        buildConfigField 'String', 'UPDATE_TOKEN', "\"${updateToken}\""
     }
     signingConfigs {
         shared {
@@ -33,6 +40,9 @@ android {
                 signingConfig signingConfigs.shared
             }
         }
+    }
+    buildFeatures {
+        buildConfig true
     }
     compileOptions {
         sourceCompatibility JavaVersion.VERSION_17
