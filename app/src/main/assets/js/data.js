@@ -212,7 +212,7 @@ const SKILLS = {
     desc: 'A burst of frost around you. Cold damage chills, slowing enemies.' },
   chain: { name: 'Arc Lash', icon: '⚡', color: '#f7f08a', kind: 'chain', tags: ['spell', 'lightning', 'chain'], el: 'light', cd: 1.0, base: 8, eff: 0.7, range: 260, chain: 3,
     desc: 'Lightning strikes an enemy and leaps to others nearby. Damage is highly variable.' },
-  orbit: { name: 'Whirling Steel', icon: '🌀', color: '#c0c8d8', kind: 'orbit', tags: ['attack', 'orbit', 'area', 'phys'], cd: 0.5, eff: 0.5, range: 62, blades: 3,
+  orbit: { name: 'Whirling Steel', icon: '🌀', color: '#c0c8d8', kind: 'orbit', tags: ['attack', 'orbit', 'area', 'phys'], cd: 0.5, eff: 0.7, range: 62, blades: 3,
     desc: 'Blades circle you constantly, cutting anything they touch.' },
   blink: { name: 'Shadowstep', icon: '👣', color: '#b78cff', kind: 'blink', tags: ['attack', 'melee', 'area', 'phys'], cd: 1.1, eff: 1.9, range: 230,
     desc: 'Teleport to a nearby enemy and strike everything around you.' },
@@ -265,7 +265,33 @@ const ZONES = [
 const ROMAN = ['', ' II', ' III', ' IV', ' V', ' VI', ' VII', ' VIII', ' IX', ' X'];
 function zoneInfo(z) { const b = ZONES[(z - 1) % ZONES.length]; const t = Math.floor((z - 1) / ZONES.length); return Object.assign({}, b, { name: b.name + (t < ROMAN.length ? ROMAN[t] : ' ' + (t + 1)), level: z }); }
 const mobHp = L => 20 * (1 + 0.55 * (L - 1) + 0.07 * (L - 1) * (L - 1)) * Math.pow(1.045, L - 1);
-const mobDmg = L => 5 * (1 + 0.25 * (L - 1) + 0.012 * (L - 1) * (L - 1)) * Math.pow(1.02, L - 1);
+const mobDmg = L => 6.5 * (1 + 0.25 * (L - 1) + 0.012 * (L - 1) * (L - 1)) * Math.pow(1.02, L - 1);
 const mobXp = L => 5 + 3 * L;
 const xpNext = L => Math.floor(40 * Math.pow(L, 1.6) + 60 * L);
 const zoneQuota = z => Math.min(220, 60 + z * 8);
+
+/* ===== classes ===== */
+const CLASSES = {
+  warden: { name: 'Warden', icon: '🛡️', tag: 'Tough melee fighter', desc: 'Stands in the middle of the pack and outlasts it.', skill: 'arc', wtype: 'mace',
+    color: '#8a2a22', hair: '#3a2a22', build: 1.18, stats: { lifePct: 15, armourPct: 25, regenPct: 0.3 } },
+  reaver: { name: 'Reaver', icon: '🌀', tag: 'Whirling blades, life steal', desc: 'Runs straight through enemies while blades spin around him.', skill: 'orbit', wtype: 'axe',
+    color: '#7a5a1e', hair: '#c8b070', build: 1.08, stats: { atkSpeed: 8, attackPct: 10, leech: 0.8, lifeOnKill: 3 } },
+  stalker: { name: 'Stalker', icon: '👣', tag: 'Fast critical striker', desc: 'Teleports from target to target and kills with critical hits.', skill: 'blink', wtype: 'sword',
+    color: '#2f5a3a', hair: '#1a1a1a', build: 0.94, stats: { moveSpeed: 10, crit: 3, critMulti: 20, dodge: 8 } },
+  arcanist: { name: 'Arcanist', icon: '🔥', tag: 'Ranged spellcaster', desc: 'Keeps a distance and burns enemies down with spells.', skill: 'bolt', wtype: 'wand',
+    color: '#34488a', hair: '#e8e2d8', build: 0.9, stats: { spellPct: 20, elePct: 10, areaPct: 10 } }
+};
+const HERO_NAMES = ['Kael', 'Mira', 'Dorn', 'Ysolde', 'Varek', 'Thessa', 'Bram', 'Nyx', 'Orin', 'Sable', 'Tyr', 'Elowen'];
+
+/* ===== maps, chests, loot scaling ===== */
+const CHESTS = {
+  wooden: { name: 'Chest', items: [1, 2], rar: 1.5, gold: 5, gem: 0.06, sigil: 0.003 },
+  ornate: { name: 'Ornate Chest', items: [3, 4], rar: 4, gold: 14, gem: 0.3, sigil: 0.012 }
+};
+const SIGIL_NAME = 'Summoning Sigil';
+// every zone deeper: better and more loot, more monsters
+const zoneFind = z => 1 + 0.05 * (z - 1);
+const zoneQuantity = z => Math.min(2, 1 + 0.025 * (z - 1));
+const ornateChance = z => Math.min(0.5, 0.1 + 0.025 * (z - 1));
+const mobCount = z => Math.min(190, 70 + z * 7);
+const mapTiles = z => Math.min(84, 54 + z * 2);

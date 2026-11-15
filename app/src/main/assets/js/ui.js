@@ -3,6 +3,7 @@
 const $ = id => document.getElementById(id);
 const el = { hud: $('hud'), panel: $('panel'), pbody: $('pbody'), sheet: $('sheet'), overlay: $('overlay'), toasts: $('toasts') };
 let paused = true, panelTab = null, invNew = false, gemsNew = false, sheetCtx = null, travelSel = 1;
+let screen = 'title', titleSel = 0, genCls = 'warden', genName = '', delArm = false, mdlChar = null, mdlAng = 0.6, mdlDrag = null;
 const esc = s => String(s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
 const fmt = n => n >= 1e6 ? (n / 1e6).toFixed(2) + 'M' : n >= 1e4 ? (n / 1e3).toFixed(1) + 'k' : String(Math.round(n));
 const WICON = { sword: '🗡️', axe: '🪓', mace: '🔨', wand: '✨', staff: '🔱' };
@@ -24,10 +25,10 @@ UI.onLevel = () => {
 };
 UI.onDeath = () => {
   el.overlay.className = 'death';
-  el.overlay.innerHTML = '<h1>YOU DIED</h1><p>' + esc(G.zi.name) + ' resets, but you keep your level, items and gems.</p><button class="btn pri" data-res="1">Resurrect</button>';
+  el.overlay.innerHTML = '<h1>YOU DIED</h1><p>You wake at the entrance of ' + esc(G.zi.name) + '. Monsters you killed stay dead; the arena boss recovers.</p><button class="btn pri" data-res="1">Resurrect</button>';
   save();
 };
-UI.onZone = () => { hudCache = {}; buildSkillBar(); $('zname').textContent = G.zi.name + '  ·  Lv ' + G.zi.level; };
+UI.onZone = () => { hudCache = {}; buildSkillBar(); };
 UI.onLoot = kind => { if (kind === 'gem') gemsNew = true; else invNew = true; };
 
 /* ---------- HUD ---------- */
@@ -49,10 +50,16 @@ function hudFrame() {
   setIf('xp', S.level >= LEVEL_CAP ? 100 : Math.floor(S.xp / xpNext(S.level) * 200) / 2, v => { $('xpbar').firstElementChild.style.width = v + '%'; });
   setIf('lvl', S.level, v => { $('lvl').textContent = 'Lv ' + v; });
   setIf('gold', S.gold, v => { $('gold').textContent = fmt(v); });
-  const prog = G.bossDead ? 'Cleared — find the portal' : G.boss ? 'Boss' : Math.min(G.kills, G.quota) + ' / ' + G.quota;
-  setIf('zt', prog, v => { $('ztxt').textContent = v; $('zbar').firstElementChild.style.width = (G.bossDead || G.boss ? 100 : G.kills / G.quota * 100) + '%'; });
-  setIf('boss', G.boss ? 1 : 0, v => { $('bossbar').classList.toggle('hidden', !v); if (v) $('bname').textContent = G.boss.name; });
-  if (G.boss) setIf('bhp', Math.ceil(G.boss.hp / G.boss.maxHp * 100), v => { $('bossbar').querySelector('i').style.width = v + '%'; });
+  const inArena = G.area === 'arena';
+  setIf('zn', inArena ? 'Arena  ·  ' + G.zi.boss : G.zi.name + '  ·  Lv ' + G.zi.level, v => { $('zname').textContent = v; });
+  const total = G.areas.map.defs.length, slain = Math.min(total, G.zs.dead.length);
+  setIf('zt', slain + ' / ' + total + ' slain', v => { $('ztxt').textContent = v; $('zbar').firstElementChild.style.width = (slain / total * 100) + '%'; });
+  setIf('zi', 'Monsters return in ' + mmss(mobWait()) + (G.zs.boss ? '  ·  Boss in ' + mmss(bossWait()) : ''), v => { $('zinfo').textContent = v; });
+  const boss = inArena ? arenaBoss() : null, showBoss = boss && boss.awake ? 1 : 0;
+  setIf('boss', showBoss, v => { $('bossbar').classList.toggle('hidden', !v); if (v) $('bname').textContent = boss.name; });
+  if (showBoss) setIf('bhp', Math.ceil(boss.hp / boss.maxHp * 100), v => { $('bossbar').querySelector('i').style.width = v + '%'; });
+  const acts = actions();
+  setIf('act', acts.map(a => a.id + a.label).join('|'), () => { $('act').innerHTML = acts.map(a => '<button class="btn pri' + (a.id === 'sigil' ? ' sigil' : '') + '" data-do="' + a.id + '">' + esc(a.label) + '</button>').join(''); });
   for (let i = 0; i < 4; i++) {
     const info = P.skills[i], u = $('cd' + i); if (!info || !u) continue;
     const f = info.def.kind === 'orbit' ? 0 : Math.round(clamp(G.cds[i] / info.cd, 0, 1) * 20) * 5;
@@ -118,6 +125,7 @@ function renderInv() {
   let h = '<h3>Equipment</h3><div class="grid" id="equip">';
   for (const sl of EQUIP_SLOTS) h += S.equip[sl] ? itemCell(S.equip[sl], 'eq', sl) : '<div class="cell empty">' + SLOT_ICON[sl] + '</div>';
   h += '</div><h3>Character <small>Level ' + S.level + '</small></h3>' + statsBlock();
+  h += '<h3>Keys</h3><div class="note"><b style="color:#ff5ad0">' + SIGIL_NAME + ' × ' + S.sigils + '</b><br>A very rare find. Use it at the Arena portal or inside the arena to summon the boss at once instead of waiting 20 minutes.</div>';
   h += '<h3>Bag <small>' + S.inv.length + ' / ' + INV_SIZE + '  ·  ▲ = likely upgrade</small></h3>';
   h += '<div class="row" style="margin-bottom:8px"><button class="btn" data-act="sellN">Sell Normal</button><button class="btn" data-act="sellM">Sell Normal + Magic</button></div><div class="grid" id="inv">';
   S.inv.forEach((it, i) => { h += itemCell(it, 'inv', i); });
@@ -166,14 +174,21 @@ function renderGems() {
     const g = gemById(s.skill), info = P.skills[i];
     h += '<div class="slot"><button class="sock" data-act="sock" data-slot="' + i + '" data-sup="-1">' + (g ? SKILLS[g.id].icon + '<span class="lv">' + g.lvl + '</span>' : '＋') + '</button>';
     for (let j = 0; j < 3; j++) {
-      if (j >= ns) { h += '<div class="sock sup lock">🔒</div>'; continue; }
+      if (j >= ns) { h += '<button class="sock sup lock" data-act="locked" data-lv="' + SUPPORT_UNLOCK[j] + '">Lv ' + SUPPORT_UNLOCK[j] + '</button>'; continue; }
       const sg = gemById(s.sup[j]), off = sg && g && !supportFits(SUPPORTS[sg.id], SKILLS[g.id]);
       h += '<button class="sock sup' + (off ? ' off' : '') + '" data-act="sock" data-slot="' + i + '" data-sup="' + j + '">' + (sg ? SUPPORTS[sg.id].icon + '<span class="lv">' + sg.lvl + '</span>' : '＋') + '</button>';
     }
     h += '<div class="info">' + (g && info ? '<b>' + esc(SKILLS[g.id].name) + '</b>' + fmt(info.dps) + ' DPS' : '<b>Empty</b>Tap to add a skill') + '</div></div>';
   }
+  const row = (ok, txt, lv) => '<div class="' + (ok ? 'ok' : '') + '"><span>' + (ok ? '✓' : '🔒') + ' ' + txt + '</span><b>' + (ok ? 'unlocked' : 'level ' + lv) + '</b></div>';
+  h += '<h3>What unlocks when <small>you are level ' + S.level + '</small></h3><div class="unlocks">';
+  for (let i = 0; i < 4; i++) h += row(S.level >= SLOT_UNLOCK[i], 'Skill slot ' + (i + 1) + ' — one more skill fires on its own', SLOT_UNLOCK[i]);
+  for (let j = 1; j < 3; j++) h += row(S.level >= SUPPORT_UNLOCK[j], 'Support socket ' + (j + 1) + ' on every skill slot', SUPPORT_UNLOCK[j]);
+  h += '</div><div class="note">A <b>skill gem</b> is an attack or spell. <b>Support gems</b> in the small sockets next to it change that one skill, but only if the support fits the skill type — a dashed socket means it does not. Socketed gems gain experience and level up to ' + GEM_MAX + ': skills hit harder, supports add 0.8% more damage per level.</div>';
+  const rc = refreshCost();
   h += '<h3>Gem trader <small>' + fmt(S.gold) + ' gold</small></h3>';
-  if (!S.shop.length) h += '<div style="color:var(--dim);font-size:12px">Sold out. New gems arrive when you clear a new zone.</div>';
+  h += '<div class="row" style="margin-bottom:8px"><button class="btn" data-act="refresh"' + (S.gold < rc ? ' disabled' : '') + '>New offer · ' + rc + ' gold</button><span class="hint">Also restocks for free when you reach a new zone.</span></div>';
+  if (!S.shop.length) h += '<div class="note">Sold out. Pay for a new offer or reach a new zone.</div>';
   S.shop.forEach((o, i) => {
     const d = gemDef(o.gem);
     h += '<button class="gemrow' + (o.gem.sup ? '' : ' skill') + '" data-act="offer" data-i="' + i + '"><span class="ic">' + d.icon + '</span><span class="tx"><b>' + esc(d.name) + '</b>' + (o.gem.sup ? 'Support' : 'Skill') + ' gem</span><span class="r"' + (S.gold < o.price ? ' style="color:#ff8a7a"' : '') + '>' + o.price + ' gold</span></button>';
@@ -293,14 +308,16 @@ function renderMenu() {
   el.pbody.className = 'notree';
   travelSel = clamp(travelSel || S.zone, 1, S.maxZone);
   const zi = zoneInfo(travelSel), as = S.opts.autoSell || 0;
-  let h = '<h3>Travel <small>highest zone unlocked: ' + S.maxZone + '</small></h3>';
-  h += '<div class="row"><button class="btn" data-act="zprev"' + (travelSel <= 1 ? ' disabled' : '') + '>◀</button><div style="flex:1;text-align:center"><b style="font-family:var(--serif);font-weight:400;color:var(--gold)">' + esc(zi.name) + '</b><br><span style="font-size:12px;color:var(--dim)">Monster level ' + zi.level + (travelSel === S.zone ? ' · you are here' : '') + '</span></div>' +
+  const bonus = (zoneFind(zi.level) - 1) * 100, qty = (zoneQuantity(zi.level) - 1) * 100;
+  let h = '<h3>Travel <small>deepest zone reached: ' + S.maxZone + '</small></h3>';
+  h += '<div class="row"><button class="btn" data-act="zprev"' + (travelSel <= 1 ? ' disabled' : '') + '>◀</button><div style="flex:1;text-align:center"><b style="font-family:var(--serif);font-weight:400;color:var(--gold)">' + esc(zi.name) + '</b><br><span style="font-size:12px;color:var(--dim)">Monster level ' + zi.level + ' · ' + mobCount(zi.level) + ' monsters' + (travelSel === S.zone ? ' · you are here' : '') + '<br>Item rarity +' + Math.round(bonus) + '% · item quantity +' + Math.round(qty) + '%</span></div>' +
     '<button class="btn" data-act="znext"' + (travelSel >= S.maxZone ? ' disabled' : '') + '>▶</button></div>';
-  h += '<div class="row" style="margin-top:8px;justify-content:center"><button class="btn pri" data-act="travel">' + (travelSel === S.zone ? 'Restart this zone' : 'Travel') + '</button></div>';
+  h += '<div class="row" style="margin-top:8px;justify-content:center"><button class="btn pri" data-act="travel">' + (travelSel === S.zone ? 'Return to the zone entrance' : 'Travel') + '</button></div>';
+  h += '<div class="note" style="margin-top:8px">New zones are unlocked by finding the teleport at the edge of a map. Deeper zones have more and tougher monsters and better loot.</div>';
   h += '<h3>Auto-sell on pickup</h3><div class="row">' + ['Off', 'Normal', 'Normal + Magic'].map((t, i) => '<button class="btn' + (as === i ? ' pri' : '') + '" data-act="autosell" data-v="' + i + '">' + t + '</button>').join('') + '</div>';
-  h += '<h3>Record</h3><div class="stats"><div>Level<b>' + S.level + '</b></div><div>Monsters slain<b>' + fmt(S.stats.kills) + '</b></div><div>Deaths<b>' + S.stats.deaths + '</b></div><div>Gold<b>' + fmt(S.gold) + '</b></div></div>';
-  h += '<h3>How to play</h3><div style="font-size:12.5px;color:var(--dim)">Drag anywhere to move. Skills fire by themselves whenever an enemy is in range. Kill enough monsters and the zone boss appears; beat it and step into the portal for a harder zone.<br><br>Power comes from three places: <b style="color:var(--text)">items</b> with random modifiers, <b style="color:var(--text)">skill gems</b> linked to support gems that change how they behave, and the <b style="color:var(--text)">passive tree</b> (one point per level).</div>';
-  h += '<h3>Game</h3><div class="row"><button class="btn danger" data-act="reset">Start a new character</button></div>';
+  h += '<h3>Record</h3><div class="stats"><div>Level<b>' + S.level + '</b></div><div>Monsters slain<b>' + fmt(S.stats.kills) + '</b></div><div>Deaths<b>' + S.stats.deaths + '</b></div><div>Bosses slain<b>' + (S.stats.bosses || 0) + '</b></div><div>' + SIGIL_NAME + 's<b>' + S.sigils + '</b></div><div>Gold<b>' + fmt(S.gold) + '</b></div></div>';
+  h += '<h3>How to play</h3><div class="note">Drag anywhere to move. Skills fire by themselves whenever an enemy is in sight. Monsters stand still until they see you.<br><br>Every zone is a closed map — the minimap in the corner fills in as you explore. Somewhere on it are <b>chests</b>, a portal to the boss <b>Arena</b>, and at the edge a <b>teleport</b> to the next, harder zone. Killed monsters and opened chests return after 10 minutes, the boss after 20.<br><br>Power comes from <b>items</b> with random modifiers, <b>skill gems</b> linked to support gems, and the <b>passive tree</b> (one point per level).</div>';
+  h += '<h3>' + esc(S.name) + ' <small>' + CLASSES[S.cls].name + '</small></h3><div class="row"><button class="btn" data-act="exit">Character select</button></div>';
   h += '<div style="margin-top:18px;font-size:11px;color:#5a5248">Cindermarch' + (window.Android && Android.version ? ' ' + esc(Android.version()) : '') + ' · saves automatically on this device</div>';
   el.pbody.innerHTML = h;
 }
@@ -325,10 +342,11 @@ const ACT = {
   respec: () => { if (respec()) { UI.toast('Passive points refunded'); treeInfo(); drawTree(); } },
   zprev: () => { travelSel--; refreshTab(); },
   znext: () => { travelSel++; refreshTab(); },
-  travel: () => { computeStats(); startZone(travelSel); save(); closePanel(); },
+  travel: () => { computeStats(); if (travelSel === S.zone) resurrect(); else startZone(travelSel); save(); closePanel(); },
   autosell: d => { S.opts.autoSell = +d.v; save(); refreshTab(); },
-  reset: () => openSheet('<h3>Start a new character?</h3><div style="font-size:13px;color:var(--dim);margin-bottom:12px">This permanently deletes your current character, items and gems.</div><div class="row"><button class="btn danger" data-act="resetYes">Delete and start over</button><button class="btn" data-act="closeSheet">Cancel</button></div>'),
-  resetYes: () => { try { localStorage.removeItem(SAVE_KEY); } catch (e) { /* ignore */ } S = null; G = null; closeSheet(); el.panel.classList.add('hidden'); panelTab = null; el.hud.classList.add('hidden'); showStart(); }
+  locked: d => UI.toast('This support socket unlocks at level ' + d.lv),
+  refresh: () => { if (refreshShop()) UI.toast('The trader has new gems', '#58d8c8'); refreshTab(); },
+  exit: () => { closeSheet(); el.panel.classList.add('hidden'); panelTab = null; exitToTitle(); showTitle(); }
 };
 function onAct(e) {
   const t = e.target.closest('[data-act]'); if (!t || t.disabled) return;
@@ -339,22 +357,76 @@ el.sheet.addEventListener('click', onAct);
 $('btns').addEventListener('click', e => { const b = e.target.closest('button'); if (b && G && !G.dead) openPanel(b.dataset.p); });
 $('tabs').addEventListener('click', e => { const b = e.target.closest('button'); if (b) showTab(b.dataset.p); });
 $('pclose').addEventListener('click', closePanel);
-el.overlay.addEventListener('click', e => {
-  const s = e.target.closest('[data-start]'), r = e.target.closest('[data-res]');
-  if (s) { newGame(s.dataset.start); el.overlay.classList.add('hidden'); el.hud.classList.remove('hidden'); paused = false; UI.toast('Drag anywhere to move', '#ffe9a0'); }
-  if (r) { resurrect(); el.overlay.className = 'hidden'; paused = false; }
-});
+$('act').addEventListener('click', e => { const b = e.target.closest('[data-do]'); if (b && G && !paused) { doAction(b.dataset.do); hudCache = {}; } });
 
-/* ---------- start screen & boot ---------- */
-function showStart() {
-  paused = true;
-  el.overlay.className = '';
-  el.overlay.innerHTML = '<h1>CINDERMARCH</h1><p>Drag anywhere to move. Your skills fire on their own — your build decides how hard they hit.</p>' +
-    '<div style="margin-bottom:10px">Choose your first skill</div><div class="starters">' +
-    ['arc', 'bolt', 'chain'].map(id => '<button class="starter" data-start="' + id + '"><span class="ic">' + SKILLS[id].icon + '</span><span><b>' + SKILLS[id].name + '</b><span>' + SKILLS[id].desc + '</span></span></button>').join('') + '</div>';
+/* ---------- title screen, character select and character generator ---------- */
+function previewChar(cls) { return { cls, equip: { weapon: { slot: 'weapon', wtype: CLASSES[cls].wtype, ilvl: 1, rarity: 0 } } }; }
+function showTitle() {
+  paused = true; screen = 'title'; delArm = false;
+  el.hud.classList.add('hidden');
+  if (!SAVE.chars.length) { showGen(); return; }
+  titleSel = clamp(titleSel, 0, SAVE.chars.length - 1);
+  const c = SAVE.chars[titleSel], C = CLASSES[c.cls];
+  mdlChar = c;
+  el.overlay.className = 'title';
+  el.overlay.innerHTML = '<h1>CINDERMARCH</h1><canvas id="mdl"></canvas>' +
+    '<div id="chars">' + SAVE.chars.map((ch, i) => '<button class="chr' + (i === titleSel ? ' on' : '') + '" data-char="' + i + '"><i>' + CLASSES[ch.cls].icon + '</i><b>' + esc(ch.name) + '</b><span>Lv ' + ch.level + ' ' + CLASSES[ch.cls].name + '</span></button>').join('') + '</div>' +
+    '<div id="tinfo"><b>' + esc(c.name) + '</b><span>Level ' + c.level + ' ' + C.name + '  ·  ' + esc(zoneInfo(c.zone).name) + '</span><small>Drag the figure to turn it</small></div>' +
+    '<div class="tbtns"><button class="btn pri big" data-enter="1">Enter</button><button class="btn big" data-new="1"' + (SAVE.chars.length >= MAX_CHARS ? ' disabled' : '') + '>New character</button></div>' +
+    '<button class="btn danger" id="tdel" data-del="1">Delete</button>';
 }
+function showGen() {
+  paused = true; screen = 'gen';
+  el.hud.classList.add('hidden');
+  const C = CLASSES[genCls];
+  mdlChar = previewChar(genCls);
+  if (!genName) genName = pick(HERO_NAMES);
+  el.overlay.className = 'title gen';
+  el.overlay.innerHTML = '<h2>New character</h2><div class="classes">' +
+    Object.keys(CLASSES).map(id => '<button class="cls' + (id === genCls ? ' on' : '') + '" data-cls="' + id + '"><i>' + CLASSES[id].icon + '</i><b>' + CLASSES[id].name + '</b><span>' + CLASSES[id].tag + '</span></button>').join('') + '</div>' +
+    '<canvas id="mdl"></canvas>' +
+    '<div class="cdesc"><span>' + C.desc + '</span><em>Starts with ' + SKILLS[C.skill].icon + ' ' + SKILLS[C.skill].name + '</em>' + Object.keys(C.stats).map(k => '<i>' + statLine(k, C.stats[k]) + '</i>').join('') + '</div>' +
+    '<input id="cname" maxlength="14" autocomplete="off" spellcheck="false" placeholder="Name" value="' + esc(genName) + '">' +
+    '<div class="tbtns">' + (SAVE.chars.length ? '<button class="btn big" data-back="1">Back</button>' : '') + '<button class="btn pri big" data-create="1">Create</button></div>';
+}
+function enterGame(i) {
+  selectChar(i);
+  travelSel = S.zone; invNew = gemsNew = false; hudCache = {};
+  screen = 'game'; mdlChar = null;
+  el.overlay.className = 'hidden'; el.overlay.innerHTML = '';
+  el.hud.classList.remove('hidden');
+  paused = false;
+  UI.toast('Drag anywhere to move', '#ffe9a0');
+}
+el.overlay.addEventListener('input', e => { if (e.target.id === 'cname') genName = e.target.value; });
+el.overlay.addEventListener('click', e => {
+  const t = sel => e.target.closest(sel);
+  let b;
+  if (t('[data-res]')) { resurrect(); el.overlay.className = 'hidden'; paused = false; hudCache = {}; return; }
+  if ((b = t('[data-char]'))) { titleSel = +b.dataset.char; showTitle(); return; }
+  if (t('[data-enter]')) { enterGame(titleSel); return; }
+  if ((b = t('[data-new]')) && !b.disabled) { genName = ''; showGen(); return; }
+  if ((b = t('[data-del]'))) {
+    if (!delArm) { delArm = true; b.textContent = 'Tap again to delete ' + SAVE.chars[titleSel].name; return; }
+    deleteChar(titleSel); titleSel = 0; showTitle(); return;
+  }
+  if ((b = t('[data-cls]'))) { genCls = b.dataset.cls; showGen(); return; }
+  if (t('[data-back]')) { showTitle(); return; }
+  if (t('[data-create]')) {
+    const name = (genName || '').trim().slice(0, 14) || pick(HERO_NAMES);
+    const i = createChar(genCls, name); genName = ''; titleSel = i; save(); enterGame(i);
+  }
+});
+// drag the 3D figure to turn it
+el.overlay.addEventListener('pointerdown', e => { if (e.target.id === 'mdl') mdlDrag = { x: e.clientX, id: e.pointerId }; });
+el.overlay.addEventListener('pointermove', e => { if (mdlDrag && e.pointerId === mdlDrag.id) { mdlAng += (e.clientX - mdlDrag.x) * 0.012; mdlDrag.x = e.clientX; } });
+const mdlEnd = () => { mdlDrag = null; };
+el.overlay.addEventListener('pointerup', mdlEnd); el.overlay.addEventListener('pointercancel', mdlEnd);
+
 window.pauseForNative = () => { if (G && S && !G.dead && !paused) openPanel('menu'); };
 window.onAndroidBack = () => {
+  if (screen === 'gen' && SAVE.chars.length) { showTitle(); return true; }
+  if (screen !== 'game') return false;
   if (!el.sheet.classList.contains('hidden')) { closeSheet(); return true; }
   if (!el.panel.classList.contains('hidden')) { closePanel(); return true; }
   if (G && S && !G.dead && !paused) { openPanel('menu'); return true; }
@@ -370,12 +442,18 @@ function frame(ts) {
   const dt = Math.min(0.05, Math.max(0, (ts - lastTs) / 1000)); lastTs = ts;
   if (G && !paused && !G.dead) update(dt);
   render();
-  if (G && S) hudFrame();
+  if (G && S && screen === 'game') hudFrame();
+  if (screen !== 'game' && mdlChar) {
+    const c = $('mdl');
+    if (!mdlDrag) mdlAng += dt * 0.5;
+    if (c) Model.draw(c, mdlChar, mdlAng, screen === 'title' ? 0.74 : 1);
+  }
   requestAnimationFrame(frame);
 }
 (function boot() {
   resize();
-  if (loadSave()) { computeStats(); startZone(S.zone); travelSel = S.zone; el.hud.classList.remove('hidden'); paused = false; }
-  else showStart();
+  loadSave();
+  titleSel = SAVE.sel;
+  showTitle();
   requestAnimationFrame(frame);
 })();

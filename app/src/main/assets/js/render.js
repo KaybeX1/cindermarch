@@ -56,6 +56,99 @@ function drawGround(camX, camY) {
   }
 }
 
+// rock walls with a lit face where they meet the floor
+function drawWalls(camX, camY) {
+  const W = G.W, H = G.H, g = G.grid, zi = G.zi;
+  const x0 = Math.floor(camX / TILE), y0 = Math.floor(camY / TILE), x1 = Math.floor((camX + VIEW.w) / TILE), y1 = Math.floor((camY + VIEW.h) / TILE);
+  const rock = shade(zi.ground, 0.38), face = shade(zi.tint, 1.25), edge = shade(zi.tint, 0.75);
+  const fl = (x, y) => x >= 0 && y >= 0 && x < W && y < H && g[y * W + x] === 1;
+  ctx.fillStyle = rock;
+  for (let y = y0; y <= y1; y++) {
+    let run = -1;
+    for (let x = x0; x <= x1 + 1; x++) {
+      const wall = x <= x1 && !fl(x, y);
+      if (wall && run < 0) run = x;
+      if (!wall && run >= 0) { ctx.fillRect(run * TILE, y * TILE, (x - run) * TILE, TILE + 0.5); run = -1; }
+    }
+  }
+  for (let y = y0; y <= y1; y++) for (let x = x0; x <= x1; x++) {
+    if (fl(x, y)) continue;
+    const px = x * TILE, py = y * TILE;
+    if (fl(x, y + 1)) { ctx.fillStyle = face; ctx.fillRect(px, py + TILE - 13, TILE, 13); ctx.fillStyle = 'rgba(0,0,0,0.35)'; ctx.fillRect(px, py + TILE, TILE, 7); }
+    ctx.fillStyle = edge;
+    if (fl(x, y - 1)) ctx.fillRect(px, py, TILE, 3);
+    if (fl(x - 1, y)) ctx.fillRect(px, py, 3, TILE);
+    if (fl(x + 1, y)) ctx.fillRect(px + TILE - 3, py, 3, TILE);
+    if (hash2(x, y) > 0.8) { ctx.fillStyle = 'rgba(255,255,255,0.05)'; ctx.fillRect(px + 8, py + 9, 14, 9); }
+  }
+}
+function mmss(ms) { const s = Math.ceil(ms / 1000); return Math.floor(s / 60) + ':' + String(s % 60).padStart(2, '0'); }
+function drawLabel(x, y, txt, col) {
+  ctx.font = '600 11px system-ui, sans-serif'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  const w = ctx.measureText(txt).width + 12;
+  ctx.fillStyle = 'rgba(0,0,0,0.8)'; ctx.fillRect(x - w / 2, y - 8, w, 16);
+  ctx.strokeStyle = col; ctx.lineWidth = 1; ctx.strokeRect(x - w / 2 + 0.5, y - 7.5, w - 1, 15);
+  ctx.fillStyle = col; ctx.fillText(txt, x, y + 0.5);
+}
+const PORTAL_COL = { arena: ['#ff7a4a', '#ff3a2a', '#ffb060'], exit: ['#9fe6ff', '#5aa8ff', '#c0a0ff'], leave: ['#c8d0d8', '#8f9aa8', '#e8eef4'] };
+function drawPortal(p) {
+  const c = PORTAL_COL[p.kind];
+  ctx.fillStyle = 'rgba(0,0,0,0.4)'; ctx.beginPath(); ctx.ellipse(p.x, p.y + 24, 20, 7, 0, 0, Math.PI * 2); ctx.fill();
+  ctx.globalAlpha = 0.28; ctx.fillStyle = c[0]; ctx.beginPath(); ctx.ellipse(p.x, p.y, 20, 28, 0, 0, Math.PI * 2); ctx.fill();
+  for (let i = 0; i < 3; i++) {
+    ctx.strokeStyle = c[i]; ctx.lineWidth = 3; ctx.globalAlpha = 0.85;
+    ctx.beginPath(); ctx.ellipse(p.x, p.y, 20 - i * 5 + Math.sin(G.t * 4 + i) * 2, 28 - i * 7, 0, 0, Math.PI * 2); ctx.stroke();
+  }
+  ctx.globalAlpha = 1;
+  let txt = 'LEAVE ARENA';
+  if (p.kind === 'arena') txt = G.zs.boss ? 'ARENA · boss returns in ' + mmss(bossWait()) : 'ARENA';
+  if (p.kind === 'exit') txt = 'TO ' + zoneInfo(S.zone + 1).name.toUpperCase();
+  drawLabel(p.x, p.y - 42, txt, c[0]);
+}
+function drawChest(c) {
+  const o = c.tier === 'ornate', w = o ? 30 : 26, h = o ? 20 : 18, x = c.x - w / 2, y = c.y - h / 2;
+  ctx.fillStyle = 'rgba(0,0,0,0.4)'; ctx.beginPath(); ctx.ellipse(c.x, c.y + h / 2 + 2, w * 0.6, 5, 0, 0, Math.PI * 2); ctx.fill();
+  ctx.globalAlpha = c.open ? 0.45 : 1;
+  ctx.fillStyle = o ? '#6a2a5a' : '#6b4a2e'; ctx.fillRect(x, y, w, h);
+  ctx.fillStyle = o ? '#8a3a76' : '#8a6238'; ctx.fillRect(x, y, w, c.open ? 3 : h * 0.42);
+  ctx.strokeStyle = o ? '#f5d76a' : '#2a1c10'; ctx.lineWidth = 1.5; ctx.strokeRect(x + 0.5, y + 0.5, w - 1, h - 1);
+  ctx.fillStyle = o ? '#f5d76a' : '#c9b06a'; ctx.fillRect(x + 3, y, 3, h); ctx.fillRect(x + w - 6, y, 3, h);
+  if (!c.open) { ctx.fillRect(c.x - 2.5, y + h * 0.36, 5, 6); if (o) { ctx.globalAlpha = 0.5 + Math.sin(G.t * 4) * 0.3; ctx.strokeStyle = '#ffe9a0'; ctx.beginPath(); ctx.arc(c.x, c.y, 22, 0, Math.PI * 2); ctx.stroke(); } }
+  ctx.globalAlpha = 1;
+}
+// minimap: only what the player has walked near is shown
+const mini = { seen: null, cv: null, g: null, img: null };
+function miniPixel(i) {
+  const W = G.W, H = G.H, g = G.grid, d = mini.img.data, o = i * 4;
+  if (g[i]) { d[o] = 172; d[o + 1] = 156; d[o + 2] = 128; d[o + 3] = 255; return; }
+  const x = i % W, y = (i - x) / W;
+  const edge = (x > 0 && g[i - 1]) || (x < W - 1 && g[i + 1]) || (y > 0 && g[i - W]) || (y < H - 1 && g[i + W]);
+  if (edge) { d[o] = 70; d[o + 1] = 60; d[o + 2] = 48; d[o + 3] = 255; }
+}
+function drawMinimap() {
+  if (mini.seen !== G.seen) {
+    mini.seen = G.seen;
+    mini.cv = document.createElement('canvas'); mini.cv.width = G.W; mini.cv.height = G.H;
+    mini.g = mini.cv.getContext('2d'); mini.img = mini.g.createImageData(G.W, G.H);
+    for (let i = 0; i < G.seen.length; i++) if (G.seen[i]) miniPixel(i);
+    G.reveal.length = 0; mini.g.putImageData(mini.img, 0, 0);
+  } else if (G.reveal.length) {
+    for (const i of G.reveal) miniPixel(i);
+    G.reveal.length = 0; mini.g.putImageData(mini.img, 0, 0);
+  }
+  const size = 112, x0 = 8, y0 = 8, k = size / (G.W * TILE);
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  ctx.fillStyle = 'rgba(8,7,6,0.72)'; ctx.fillRect(x0, y0, size, size);
+  ctx.imageSmoothingEnabled = false;
+  ctx.drawImage(mini.cv, x0, y0, size, size);
+  ctx.imageSmoothingEnabled = true;
+  const dot = (p, col, r) => { ctx.fillStyle = col; ctx.beginPath(); ctx.arc(x0 + p.x * k, y0 + p.y * k, r, 0, Math.PI * 2); ctx.fill(); };
+  for (const c of G.chests) if (c.seen && !c.open) dot(c, '#f5d76a', 2);
+  for (const p of G.portals) if (p.seen) { dot(p, '#000', 4.5); dot(p, PORTAL_COL[p.kind][0], 3.2); }
+  dot(G.player, '#000', 3.6); dot(G.player, '#ffffff', 2.4);
+  ctx.strokeStyle = '#4a3d2e'; ctx.lineWidth = 1; ctx.strokeRect(x0 + 0.5, y0 + 0.5, size - 1, size - 1);
+}
+
 function drawMob(m) {
   const pl = G.player, ang = Math.atan2(pl.y - m.y, pl.x - m.x);
   const bob = Math.sin(m.wob) * 1.2, lx = m.lunge > 0 ? Math.cos(ang) * 6 : 0, ly = m.lunge > 0 ? Math.sin(ang) * 6 : 0;
@@ -119,11 +212,11 @@ function drawPlayer() {
   ctx.strokeStyle = '#d8d8e0'; ctx.lineWidth = 2.5; ctx.lineCap = 'round';
   ctx.beginPath(); ctx.moveTo(6, 8); ctx.lineTo(22, 5); ctx.stroke();
   // cloak + head
-  ctx.fillStyle = pl.flash > 0 ? '#ffffff' : '#7a2a22'; ctx.strokeStyle = 'rgba(0,0,0,0.7)'; ctx.lineWidth = 1.5;
+  ctx.fillStyle = pl.flash > 0 ? '#ffffff' : CLASSES[S.cls].color; ctx.strokeStyle = 'rgba(0,0,0,0.7)'; ctx.lineWidth = 1.5;
   ctx.beginPath(); ctx.arc(0, 0, PLAYER_R, 0, Math.PI * 2); ctx.fill(); ctx.stroke();
   ctx.fillStyle = pl.flash > 0 ? '#ffffff' : '#e0c8a0';
   ctx.beginPath(); ctx.arc(2, 0, 5.5, 0, Math.PI * 2); ctx.fill();
-  ctx.fillStyle = '#3a2a22'; ctx.beginPath(); ctx.arc(-1, 0, 5.5, Math.PI * 0.5, Math.PI * 1.5); ctx.fill();
+  ctx.fillStyle = CLASSES[S.cls].hair; ctx.beginPath(); ctx.arc(-1, 0, 5.5, Math.PI * 0.5, Math.PI * 1.5); ctx.fill();
   ctx.restore();
 }
 
@@ -175,11 +268,11 @@ function drawDrop(d) {
     ctx.beginPath(); ctx.arc(d.x, d.y - bounce, 4, 0, Math.PI * 2); ctx.fill(); ctx.stroke();
     return;
   }
-  const name = d.gem ? gemDef(d.gem).name : d.item.name, col = d.gem ? '#58d8c8' : RARITY_COLOR[d.item.rarity];
+  const name = d.sigil ? SIGIL_NAME : d.gem ? gemDef(d.gem).name : d.item.name, col = d.sigil ? '#ff5ad0' : d.gem ? '#58d8c8' : RARITY_COLOR[d.item.rarity];
   ctx.font = (d.item && d.item.rarity === 0 ? '9px' : '600 10px') + ' system-ui, sans-serif';
   const w = ctx.measureText(name).width + 10, h = 15, x = d.x - w / 2, y = d.y - h / 2 - bounce;
   ctx.fillStyle = 'rgba(0,0,0,0.78)'; ctx.fillRect(x, y, w, h);
-  if (d.gem || d.item.rarity > 0) { ctx.strokeStyle = col; ctx.lineWidth = 1; ctx.strokeRect(x + 0.5, y + 0.5, w - 1, h - 1); }
+  if (d.sigil || d.gem || d.item.rarity > 0) { ctx.strokeStyle = col; ctx.lineWidth = 1; ctx.strokeRect(x + 0.5, y + 0.5, w - 1, h - 1); }
   ctx.fillStyle = col; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
   ctx.fillText(name, d.x, y + h / 2 + 0.5);
 }
@@ -193,16 +286,12 @@ function render() {
   ctx.setTransform(k, 0, 0, k, -camX * k, -camY * k);
   drawGround(camX, camY);
 
-  if (G.portal) {
-    const p = G.portal;
-    for (let i = 0; i < 3; i++) {
-      ctx.strokeStyle = ['#9fe6ff', '#5aa8ff', '#c0a0ff'][i]; ctx.lineWidth = 3; ctx.globalAlpha = 0.8;
-      ctx.beginPath(); ctx.ellipse(p.x, p.y, 20 - i * 5 + Math.sin(G.t * 4 + i) * 2, 28 - i * 7, 0, 0, Math.PI * 2); ctx.stroke();
-    }
-    ctx.globalAlpha = 0.25; ctx.fillStyle = '#9fe6ff'; ctx.beginPath(); ctx.ellipse(p.x, p.y, 20, 28, 0, 0, Math.PI * 2); ctx.fill(); ctx.globalAlpha = 1;
-  }
-  for (const d of G.drops) drawDrop(d);
-  for (const m of G.mobs) if (!m.dead) drawMob(m);
+  drawWalls(camX, camY);
+  const vis = (o, pad) => o.x > camX - pad && o.x < camX + VIEW.w + pad && o.y > camY - pad && o.y < camY + VIEW.h + pad;
+  for (const c of G.chests) if (vis(c, 40)) drawChest(c);
+  for (const p of G.portals) if (vis(p, 160)) drawPortal(p);
+  for (const d of G.drops) if (vis(d, 80)) drawDrop(d);
+  for (const m of G.mobs) if (!m.dead && vis(m, 60)) drawMob(m);
   for (const f of G.fx) if (f.k === 'warn') drawFx(f);
   drawPlayer();
   for (const info of P.skills) if (info && info.def.kind === 'orbit') {
@@ -244,15 +333,7 @@ function render() {
   if (vignette) ctx.drawImage(vignette, 0, 0, W, H);
   const lf = pl.life / P.maxLife;
   if (lf < 0.35) { ctx.fillStyle = 'rgba(160,10,10,' + ((0.35 - lf) * 0.9 * (0.7 + Math.sin(G.t * 6) * 0.3)).toFixed(3) + ')'; ctx.fillRect(0, 0, W, H); }
-  if (G.portal) {       // arrow toward the portal when it is off-screen
-    const dx = G.portal.x - pl.x, dy = G.portal.y - pl.y;
-    if (Math.abs(dx) > VIEW.w / 2 - 20 || Math.abs(dy) > VIEW.h / 2 - 20) {
-      const a = Math.atan2(dy, dx), R = Math.min(W, H) * 0.3;
-      ctx.save(); ctx.translate(W / 2 + Math.cos(a) * R, H / 2 + Math.sin(a) * R); ctx.rotate(a); ctx.scale(DPR, DPR);
-      ctx.fillStyle = '#9fe6ff'; ctx.beginPath(); ctx.moveTo(14, 0); ctx.lineTo(-8, -9); ctx.lineTo(-3, 0); ctx.lineTo(-8, 9); ctx.closePath(); ctx.fill();
-      ctx.restore();
-    }
-  }
+  drawMinimap();
   if (joy.on) {
     ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
     ctx.strokeStyle = 'rgba(255,255,255,0.28)'; ctx.lineWidth = 2;
