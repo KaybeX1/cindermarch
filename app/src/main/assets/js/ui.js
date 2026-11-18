@@ -1,13 +1,14 @@
 'use strict';
-/* ===== DOM interface: HUD, panels, overlays, main loop ===== */
+/* ===== DOM interface: title, camp, run HUD, ability choice, panels, main loop ===== */
 const $ = id => document.getElementById(id);
 const el = { hud: $('hud'), panel: $('panel'), pbody: $('pbody'), sheet: $('sheet'), overlay: $('overlay'), toasts: $('toasts') };
-let paused = true, panelTab = null, invNew = false, gemsNew = false, sheetCtx = null, travelSel = 1;
-let screen = 'title', titleSel = 0, genCls = 'warden', genName = '', delArm = false, mdlChar = null, mdlAng = 0.6, mdlDrag = null;
+let paused = true, panelTab = null, invNew = false, gemsNew = false, sheetCtx = null;
+let screen = 'title', titleSel = 0, genCls = 'warden', genName = '', delArm = false, mdlChar = null, mdlAng = 0.6, mdlDrag = null, pickOpen = false;
 const esc = s => String(s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
 const fmt = n => n >= 1e6 ? (n / 1e6).toFixed(2) + 'M' : n >= 1e4 ? (n / 1e3).toFixed(1) + 'k' : String(Math.round(n));
 const WICON = { sword: '🗡️', axe: '🪓', mace: '🔨', wand: '✨', staff: '🔱' };
 const itemIcon = it => it.slot === 'weapon' ? WICON[it.wtype] || '⚔️' : SLOT_ICON[it.slot];
+const chLevels = ch => roomLevel(ch, 1) + '–' + roomLevel(ch, CH_ROOMS);
 
 /* ---------- toasts & game callbacks ---------- */
 UI.toast = (msg, color) => {
@@ -18,18 +19,17 @@ UI.toast = (msg, color) => {
   setTimeout(() => d.remove(), 2600);
 };
 UI.onLevel = () => {
-  UI.toast('Level ' + S.level + ' — passive point gained', '#ffe9a0');
+  UI.toast('Character level ' + S.level + ' — passive point gained', '#ffe9a0');
   if (SLOT_UNLOCK.includes(S.level)) UI.toast('New skill slot unlocked', '#58d8c8');
-  if (S.level % 8 === 0 && S.level <= 16) UI.toast('New support socket unlocked', '#58d8c8');
   buildSkillBar(); save();
 };
-UI.onDeath = () => {
-  el.overlay.className = 'death';
-  el.overlay.innerHTML = '<h1>YOU DIED</h1><p>You wake at the entrance of ' + esc(G.zi.name) + '. Monsters you killed stay dead; the arena boss recovers.</p><button class="btn pri" data-res="1">Resurrect</button>';
-  save();
+UI.onRoom = () => {
+  hudCache = {}; buildSkillBar();
+  if (G.boss) UI.toast(R.room === CH_ROOMS ? 'The chapter boss awaits' : 'Boss room', '#ff9a7a');
 };
-UI.onZone = () => { hudCache = {}; buildSkillBar(); };
+UI.onClear = () => { if (!G.boss) UI.toast('Room cleared — the door is open', '#9fe6ff'); };
 UI.onLoot = kind => { if (kind === 'gem') gemsNew = true; else invNew = true; };
+UI.onRunEnd = () => { paused = true; showEnd(); };
 
 /* ---------- HUD ---------- */
 let hudCache = {};
@@ -50,25 +50,34 @@ function hudFrame() {
   setIf('xp', S.level >= LEVEL_CAP ? 100 : Math.floor(S.xp / xpNext(S.level) * 200) / 2, v => { $('xpbar').firstElementChild.style.width = v + '%'; });
   setIf('lvl', S.level, v => { $('lvl').textContent = 'Lv ' + v; });
   setIf('gold', S.gold, v => { $('gold').textContent = fmt(v); });
-  const inArena = G.area === 'arena';
-  setIf('zn', inArena ? 'Arena  ·  ' + G.zi.boss : G.zi.name + '  ·  Lv ' + G.zi.level, v => { $('zname').textContent = v; });
-  const total = G.areas.map.defs.length, slain = Math.min(total, G.zs.dead.length);
-  setIf('zt', slain + ' / ' + total + ' slain', v => { $('ztxt').textContent = v; $('zbar').firstElementChild.style.width = (slain / total * 100) + '%'; });
-  setIf('zi', 'Monsters return in ' + mmss(mobWait()) + (G.zs.boss ? '  ·  Boss in ' + mmss(bossWait()) : ''), v => { $('zinfo').textContent = v; });
-  const boss = inArena ? arenaBoss() : null, showBoss = boss && boss.awake ? 1 : 0;
-  setIf('boss', showBoss, v => { $('bossbar').classList.toggle('hidden', !v); if (v) $('bname').textContent = boss.name; });
-  if (showBoss) setIf('bhp', Math.ceil(boss.hp / boss.maxHp * 100), v => { $('bossbar').querySelector('i').style.width = v + '%'; });
-  const acts = actions();
-  setIf('act', acts.map(a => a.id + a.label).join('|'), () => { $('act').innerHTML = acts.map(a => '<button class="btn pri' + (a.id === 'sigil' ? ' sigil' : '') + '" data-do="' + a.id + '">' + esc(a.label) + '</button>').join(''); });
+  setIf('zn', G.zi.name + '  ·  Room ' + R.room + ' / ' + CH_ROOMS, v => { $('zname').textContent = v; });
+  setIf('rx', R.lvl + ':' + Math.floor(R.xp / runXpNext(R.lvl) * 50), () => { $('ztxt').textContent = 'Run level ' + R.lvl; $('zbar').firstElementChild.style.width = (R.xp / runXpNext(R.lvl) * 100) + '%'; });
+  const info = G.cleared ? (R.picks ? 'Choose an ability' : 'The door is open — walk through it ↑') : G.boss ? 'Defeat the boss' : G.mobs.length + ' monster' + (G.mobs.length === 1 ? '' : 's') + ' left  ·  stand still to attack';
+  setIf('zi', info, v => { $('zinfo').textContent = v; });
+  const boss = bossMob();
+  setIf('boss', boss ? 1 : 0, v => { $('bossbar').classList.toggle('hidden', !v); if (v) $('bname').textContent = boss.name; });
+  if (boss) setIf('bhp', Math.ceil(boss.hp / boss.maxHp * 100), v => { $('bossbar').querySelector('i').style.width = v + '%'; });
+  setIf('ab', JSON.stringify(R.abil), () => {
+    $('abil').innerHTML = Object.keys(R.abil).map(id => '<span title="' + esc(ABILITIES[id].name) + '">' + ABILITIES[id].icon + (R.abil[id] > 1 ? '<b>' + R.abil[id] + '</b>' : '') + '</span>').join('');
+  });
   for (let i = 0; i < 4; i++) {
     const info = P.skills[i], u = $('cd' + i); if (!info || !u) continue;
     const f = info.def.kind === 'orbit' ? 0 : Math.round(clamp(G.cds[i] / info.cd, 0, 1) * 20) * 5;
     setIf('cd' + i, f, v => { u.style.height = v + '%'; });
   }
+  dots();
+}
+function dots() {
   const pts = passivePoints();
-  setIf('dT', pts, v => { const b = $('dotTree'); b.textContent = v; b.classList.toggle('on', v > 0); });
-  setIf('dI', invNew, v => { const b = $('dotInv'); b.textContent = '!'; b.classList.toggle('on', v); });
-  setIf('dG', gemsNew, v => { const b = $('dotGems'); b.textContent = '!'; b.classList.toggle('on', v); });
+  const any = $('btns').querySelector('[data-dot="any"]');
+  if (any) { any.textContent = pts > 0 ? pts : '!'; any.classList.toggle('on', pts > 0 || invNew || gemsNew); }
+  for (const root of [$('campbtns')]) {
+    if (!root) continue;
+    const t = root.querySelector('[data-dot="tree"]'), i = root.querySelector('[data-dot="inv"]'), g = root.querySelector('[data-dot="gems"]');
+    if (t) { t.textContent = pts; t.classList.toggle('on', pts > 0); }
+    if (i) { i.textContent = '!'; i.classList.toggle('on', invNew); }
+    if (g) { g.textContent = '!'; g.classList.toggle('on', gemsNew); }
+  }
 }
 
 /* ---------- panel plumbing ---------- */
@@ -78,9 +87,11 @@ function openPanel(tab) {
   showTab(tab);
 }
 function closePanel() {
-  closeSheet(); el.panel.classList.add('hidden'); panelTab = null; paused = false;
+  closeSheet(); el.panel.classList.add('hidden'); panelTab = null;
   if (statsDirty) computeStats();
-  buildSkillBar(); hudCache = {}; save();
+  if (screen === 'run') { paused = false; buildSkillBar(); hudCache = {}; }
+  if (screen === 'camp') showCamp();
+  save();
 }
 function showTab(tab) {
   panelTab = tab; closeSheet();
@@ -124,8 +135,9 @@ function renderInv() {
   el.pbody.className = 'notree';
   let h = '<h3>Equipment</h3><div class="grid" id="equip">';
   for (const sl of EQUIP_SLOTS) h += S.equip[sl] ? itemCell(S.equip[sl], 'eq', sl) : '<div class="cell empty">' + SLOT_ICON[sl] + '</div>';
-  h += '</div><h3>Character <small>Level ' + S.level + '</small></h3>' + statsBlock();
-  h += '<h3>Keys</h3><div class="note"><b style="color:#ff5ad0">' + SIGIL_NAME + ' × ' + S.sigils + '</b><br>A very rare find. Use it at the Arena portal or inside the arena to summon the boss at once instead of waiting 20 minutes.</div>';
+  const pct = S.level >= LEVEL_CAP ? 'max' : Math.floor(S.xp / xpNext(S.level) * 100) + '% to next';
+  h += '</div><h3>' + esc(S.name) + ' <small>Level ' + S.level + ' ' + CLASSES[S.cls].name + ' · ' + pct + '</small></h3>' + statsBlock();
+  if (R) h += '<div class="note" style="margin-top:6px">Stats include the abilities picked in this run.</div>';
   h += '<h3>Bag <small>' + S.inv.length + ' / ' + INV_SIZE + '  ·  ▲ = likely upgrade</small></h3>';
   h += '<div class="row" style="margin-bottom:8px"><button class="btn" data-act="sellN">Sell Normal</button><button class="btn" data-act="sellM">Sell Normal + Magic</button></div><div class="grid" id="inv">';
   S.inv.forEach((it, i) => { h += itemCell(it, 'inv', i); });
@@ -142,15 +154,13 @@ function showItem(kind, key) {
   openSheet(h + '<button class="btn" data-act="closeSheet">Close</button></div>', { it, kind, key });
 }
 
-/* ---------- skills tab ---------- */
+/* ---------- skills tab: permanent skill gems, plus the abilities a run can offer ---------- */
 function gemCard(g, info) {
-  const d = gemDef(g);
-  let h = '<div class="card"><div class="nm" style="color:' + (g.sup ? 'var(--gem)' : '#ffd9b0') + '">' + d.icon + ' ' + esc(d.name) + '</div>';
-  h += '<div class="sub">' + (g.sup ? 'Support gem' : 'Skill gem') + ' · Level ' + g.lvl + (g.lvl < GEM_MAX ? ' · ' + Math.floor(g.xp / gemXpNext(g.lvl) * 100) + '% to next' : ' (max)') + '</div>';
-  if (!g.sup) h += '<div class="imp">' + d.tags.filter(t => t !== 'orbit').join(' · ') + '</div>';
-  else h += '<div class="imp">Works with: ' + (d.req ? d.req.filter(t => t !== 'orbit').join(', ') + ' skills' : 'any skill') + '</div>';
-  h += '<hr><div class="desc">' + esc(d.desc) + '</div>';
-  if (g.sup && g.lvl > 1) h += '<div class="af">+' + ((g.lvl - 1) * 0.8).toFixed(1) + '% more damage from gem level</div>';
+  const d = SKILLS[g.id];
+  let h = '<div class="card"><div class="nm" style="color:#ffd9b0">' + d.icon + ' ' + esc(d.name) + '</div>';
+  h += '<div class="sub">Skill gem · Level ' + g.lvl + (g.lvl < GEM_MAX ? ' · ' + Math.floor(g.xp / gemXpNext(g.lvl) * 100) + '% to next' : ' (max)') + '</div>';
+  h += '<div class="imp">' + d.tags.filter(t => t !== 'orbit').join(' · ') + '</div>';
+  h += '<hr><div class="desc">' + esc(d.desc) + (d.kind === 'orbit' ? ' Keeps spinning while you move.' : '') + '</div>';
   if (info) {
     h += '<hr><div class="base">' + fmt(info.dps) + ' DPS · ' + fmt(info.avg) + ' avg hit · every ' + info.cd.toFixed(2) + 's</div>';
     const parts = [['phys', 'physical'], ['fire', 'fire'], ['cold', 'cold'], ['light', 'lightning']].filter(p => info.dmg[p[0]] >= 0.5).map(p => fmt(info.dmg[p[0]]) + ' ' + p[1]);
@@ -158,62 +168,65 @@ function gemCard(g, info) {
   }
   return h + '</div>';
 }
-function gemRow(g, act, extra, dis) {
-  const d = gemDef(g), so = gemSocketed(g.uid);
-  return '<button class="gemrow' + (g.sup ? '' : ' skill') + (dis ? ' dis' : '') + '" ' + (dis ? '' : 'data-act="' + act + '" data-id="' + g.uid + '"') + '><span class="ic">' + d.icon + '</span><span class="tx"><b>' + esc(d.name) + '</b>' +
-    (g.sup ? 'Support' : 'Skill') + ' · Lv ' + g.lvl + (so ? ' · in slot ' + (so.slot + 1) : '') + (dis ? ' · not compatible' : '') + '</span>' + (extra ? '<span class="r">' + extra + '</span>' : '') + '</button>';
+function gemRow(g, act, extra) {
+  const d = SKILLS[g.id], so = gemSocketed(g.uid);
+  return '<button class="gemrow skill" data-act="' + act + '" data-id="' + g.uid + '"><span class="ic">' + d.icon + '</span><span class="tx"><b>' + esc(d.name) + '</b>' +
+    'Skill · Lv ' + g.lvl + (so ? ' · in slot ' + (so.slot + 1) : '') + '</span>' + (extra ? '<span class="r">' + extra + '</span>' : '') + '</button>';
+}
+function abilityFor(a) {
+  if (!a.sup) return 'any build';
+  return a.req ? a.req.filter(t => t !== 'orbit').join(', ') + ' skills' : 'every skill';
 }
 function renderGems() {
   gemsNew = false;
   el.pbody.className = 'notree';
-  const ns = supportSockets();
-  let h = '<h3>Skill slots <small>' + ns + ' support socket' + (ns > 1 ? 's' : '') + ' each</small></h3>';
+  let h = '<h3>Skill slots <small>skills attack on their own while you stand still</small></h3>';
   for (let i = 0; i < 4; i++) {
     const s = S.slots[i];
-    if (!slotUnlocked(i)) { h += '<div class="slot locked"><div class="sock lock">🔒</div><div class="info"><b>Locked</b>Unlocks at level ' + SLOT_UNLOCK[i] + '</div></div>'; continue; }
+    if (!slotUnlocked(i)) { h += '<div class="slot locked"><div class="sock lock">🔒</div><div class="info"><b>Locked</b>Unlocks at character level ' + SLOT_UNLOCK[i] + '</div></div>'; continue; }
     const g = gemById(s.skill), info = P.skills[i];
-    h += '<div class="slot"><button class="sock" data-act="sock" data-slot="' + i + '" data-sup="-1">' + (g ? SKILLS[g.id].icon + '<span class="lv">' + g.lvl + '</span>' : '＋') + '</button>';
-    for (let j = 0; j < 3; j++) {
-      if (j >= ns) { h += '<button class="sock sup lock" data-act="locked" data-lv="' + SUPPORT_UNLOCK[j] + '">Lv ' + SUPPORT_UNLOCK[j] + '</button>'; continue; }
-      const sg = gemById(s.sup[j]), off = sg && g && !supportFits(SUPPORTS[sg.id], SKILLS[g.id]);
-      h += '<button class="sock sup' + (off ? ' off' : '') + '" data-act="sock" data-slot="' + i + '" data-sup="' + j + '">' + (sg ? SUPPORTS[sg.id].icon + '<span class="lv">' + sg.lvl + '</span>' : '＋') + '</button>';
-    }
-    h += '<div class="info">' + (g && info ? '<b>' + esc(SKILLS[g.id].name) + '</b>' + fmt(info.dps) + ' DPS' : '<b>Empty</b>Tap to add a skill') + '</div></div>';
+    h += '<div class="slot"><button class="sock" data-act="sock" data-slot="' + i + '">' + (g ? SKILLS[g.id].icon + '<span class="lv">' + g.lvl + '</span>' : '＋') + '</button>';
+    h += '<div class="info">' + (g && info ? '<b>' + esc(SKILLS[g.id].name) + '</b>' + fmt(info.dps) + ' DPS · every ' + info.cd.toFixed(2) + 's' : '<b>Empty</b>Tap to put a skill gem here') + '</div></div>';
   }
   const row = (ok, txt, lv) => '<div class="' + (ok ? 'ok' : '') + '"><span>' + (ok ? '✓' : '🔒') + ' ' + txt + '</span><b>' + (ok ? 'unlocked' : 'level ' + lv) + '</b></div>';
   h += '<h3>What unlocks when <small>you are level ' + S.level + '</small></h3><div class="unlocks">';
-  for (let i = 0; i < 4; i++) h += row(S.level >= SLOT_UNLOCK[i], 'Skill slot ' + (i + 1) + ' — one more skill fires on its own', SLOT_UNLOCK[i]);
-  for (let j = 1; j < 3; j++) h += row(S.level >= SUPPORT_UNLOCK[j], 'Support socket ' + (j + 1) + ' on every skill slot', SUPPORT_UNLOCK[j]);
-  h += '</div><div class="note">A <b>skill gem</b> is an attack or spell. <b>Support gems</b> in the small sockets next to it change that one skill, but only if the support fits the skill type — a dashed socket means it does not. Socketed gems gain experience and level up to ' + GEM_MAX + ': skills hit harder, supports add 0.8% more damage per level.</div>';
+  for (let i = 0; i < 4; i++) h += row(S.level >= SLOT_UNLOCK[i], 'Skill slot ' + (i + 1) + ' — one more skill attacks for you', SLOT_UNLOCK[i]);
+  h += '</div><div class="note">Skill gems are permanent and level up as they kill, up to level ' + GEM_MAX + '. Every skill attacks only while you stand still — move to dodge, stop to fight. Whirling Steel is the exception: its blades keep spinning while you run.</div>';
+  h += '<h3>Run abilities <small>' + Object.keys(ABILITIES).length + ' in the pool</small></h3>';
+  h += '<div class="note" style="margin-bottom:8px">At the start of a run, at every run level-up and after every boss you choose 1 of 3 abilities. They last until the run ends. Abilities that change skills (the old support gems) only appear if they fit one of your skills; most can be taken several times.</div>';
+  for (const id in ABILITIES) {
+    const a = ABILITIES[id], n = R && R.abil[id] || 0;
+    h += '<div class="gemrow' + (n ? ' have' : '') + '"><span class="ic">' + a.icon + '</span><span class="tx"><b>' + esc(a.name) + (n ? ' · taken ' + n + '×' : '') + '</b>' + esc(a.desc) + '<br><i>For ' + abilityFor(a) + (a.max < 50 ? ' · up to ' + a.max + '×' : '') + '</i></span></div>';
+  }
   const rc = refreshCost();
   h += '<h3>Gem trader <small>' + fmt(S.gold) + ' gold</small></h3>';
-  h += '<div class="row" style="margin-bottom:8px"><button class="btn" data-act="refresh"' + (S.gold < rc ? ' disabled' : '') + '>New offer · ' + rc + ' gold</button><span class="hint">Also restocks for free when you reach a new zone.</span></div>';
-  if (!S.shop.length) h += '<div class="note">Sold out. Pay for a new offer or reach a new zone.</div>';
+  h += '<div class="row" style="margin-bottom:8px"><button class="btn" data-act="refresh"' + (S.gold < rc ? ' disabled' : '') + '>New offer · ' + rc + ' gold</button><span class="hint">Restocks for free when you unlock a new chapter.</span></div>';
+  if (!S.shop.length) h += '<div class="note">Sold out. Pay for a new offer or clear a chapter.</div>';
   S.shop.forEach((o, i) => {
-    const d = gemDef(o.gem);
-    h += '<button class="gemrow' + (o.gem.sup ? '' : ' skill') + '" data-act="offer" data-i="' + i + '"><span class="ic">' + d.icon + '</span><span class="tx"><b>' + esc(d.name) + '</b>' + (o.gem.sup ? 'Support' : 'Skill') + ' gem</span><span class="r"' + (S.gold < o.price ? ' style="color:#ff8a7a"' : '') + '>' + o.price + ' gold</span></button>';
+    const d = SKILLS[o.gem.id];
+    h += '<button class="gemrow skill" data-act="offer" data-i="' + i + '"><span class="ic">' + d.icon + '</span><span class="tx"><b>' + esc(d.name) + '</b>Skill gem</span><span class="r"' + (S.gold < o.price ? ' style="color:#ff8a7a"' : '') + '>' + o.price + ' gold</span></button>';
   });
   h += '<h3>Your gems <small>' + S.gems.length + '</small></h3>';
-  S.gems.slice().sort((a, b) => (a.sup - b.sup) || gemDef(a).name.localeCompare(gemDef(b).name) || b.lvl - a.lvl).forEach(g => { h += gemRow(g, 'gem'); });
+  S.gems.slice().sort((a, b) => SKILLS[a.id].name.localeCompare(SKILLS[b.id].name) || b.lvl - a.lvl).forEach(g => { h += gemRow(g, 'gem'); });
   el.pbody.innerHTML = h;
 }
-function showSock(slot, sup) {
-  const s = S.slots[slot], cur = gemById(sup < 0 ? s.skill : s.sup[sup]), skill = gemById(s.skill);
-  let h = '<h3>' + (sup < 0 ? 'Skill' : 'Support') + ' socket — slot ' + (slot + 1) + '</h3>';
-  if (cur) h += '<div class="cards">' + gemCard(cur, sup < 0 ? P.skills[slot] : null) + '</div>';
-  const list = S.gems.filter(g => (sup < 0 ? !g.sup : g.sup) && g !== cur);
-  if (!list.length) h += '<div style="color:var(--dim);font-size:12px;margin-bottom:10px">No other ' + (sup < 0 ? 'skill' : 'support') + ' gems yet. Gems drop from monsters and are sold by the gem trader.</div>';
-  else h += '<div style="color:var(--dim);font-size:12px;margin-bottom:6px">Tap a gem to socket it here:</div>';
-  for (const g of list) h += gemRow(g, 'pick', '', sup >= 0 && skill && !supportFits(SUPPORTS[g.id], SKILLS[skill.id]));
+function showSock(slot) {
+  const cur = gemById(S.slots[slot].skill);
+  let h = '<h3>Skill slot ' + (slot + 1) + '</h3>';
+  if (cur) h += '<div class="cards">' + gemCard(cur, P.skills[slot]) + '</div>';
+  const list = S.gems.filter(g => g !== cur);
+  if (!list.length) h += '<div class="note" style="margin-bottom:10px">No other skill gems yet. They drop from monsters and bosses and are sold by the gem trader.</div>';
+  else h += '<div class="note" style="margin-bottom:6px">Tap a gem to put it here:</div>';
+  for (const g of list) h += gemRow(g, 'pick');
   h += '<div class="row" style="margin-top:8px">' + (cur ? '<button class="btn" data-act="unsock">Remove gem</button>' : '') + '<button class="btn" data-act="closeSheet">Close</button></div>';
-  openSheet(h, { slot, sup });
+  openSheet(h, { slot });
 }
 function showGem(id) {
   const g = gemById(id); if (!g) return;
   const so = gemSocketed(id);
-  let h = '<div class="cards">' + gemCard(g, so && so.sup < 0 ? P.skills[so.slot] : null) + '</div><div class="row">';
+  let h = '<div class="cards">' + gemCard(g, so ? P.skills[so.slot] : null) + '</div><div class="row">';
   if (!so) h += '<button class="btn" data-act="sellGem">Sell · ' + (25 + g.lvl * 10) + ' gold</button>';
-  else h += '<span style="color:var(--dim);font-size:12px;flex:1">Socketed in slot ' + (so.slot + 1) + '</span>';
+  else h += '<span style="color:var(--dim);font-size:12px;flex:1">In skill slot ' + (so.slot + 1) + '</span>';
   openSheet(h + '<button class="btn" data-act="closeSheet">Close</button></div>', { gem: id });
 }
 function showOffer(i) {
@@ -263,7 +276,7 @@ function treeInfo() {
   $('treepts').textContent = pts + ' point' + (pts === 1 ? '' : 's') + ' to spend';
   const rc = respecCost(), rb = $('treerespec');
   rb.textContent = 'Refund all · ' + rc + ' gold'; rb.disabled = S.tree.length <= 1 || S.gold < rc;
-  if (!n) { $('treeinfo').innerHTML = '<div class="t" style="color:var(--dim)">Tap a node to inspect it. Drag to pan, pinch to zoom. You can only take nodes connected to ones you already own.</div>'; return; }
+  if (!n) { $('treeinfo').innerHTML = '<div class="t" style="color:var(--dim)">Tap a node to inspect it. Drag to pan, pinch to zoom. You can only take nodes connected to ones you already own. You get one point per character level.</div>'; return; }
   const has = S.tree.includes(n.id);
   let h = '<div class="t"><b style="color:' + n.color + '">' + esc(nodeTitle(n)) + (n.type === 'key' ? ' · Keystone' : n.type === 'notable' ? ' · Notable' : '') + '</b>';
   for (const k in n.stats) h += '<span>' + statLine(k, n.stats[k]) + '</span>';
@@ -290,14 +303,14 @@ function drawTree() {
   g.textAlign = 'center'; g.textBaseline = 'top';
   for (const id in TREE.nodes) {
     const n = TREE.nodes[id], has = own.has(id), avail = !has && n.adj.some(a => own.has(a));
-    const R = n.type === 'key' ? 19 : n.type === 'notable' ? 14 : n.type === 'start' ? 12 : 9;
+    const R0 = n.type === 'key' ? 19 : n.type === 'notable' ? 14 : n.type === 'start' ? 12 : 9;
     g.beginPath();
-    if (n.type === 'key') { for (let k = 0; k < 6; k++) g.lineTo(n.x + Math.cos(k * Math.PI / 3 + Math.PI / 6) * R, n.y + Math.sin(k * Math.PI / 3 + Math.PI / 6) * R); g.closePath(); }
-    else g.arc(n.x, n.y, R, 0, Math.PI * 2);
+    if (n.type === 'key') { for (let k = 0; k < 6; k++) g.lineTo(n.x + Math.cos(k * Math.PI / 3 + Math.PI / 6) * R0, n.y + Math.sin(k * Math.PI / 3 + Math.PI / 6) * R0); g.closePath(); }
+    else g.arc(n.x, n.y, R0, 0, Math.PI * 2);
     g.fillStyle = has ? n.color : '#1a1614'; g.fill();
     g.lineWidth = has ? 3 : avail ? 2.5 : 1.5; g.strokeStyle = has ? '#fff6d8' : n.color; g.globalAlpha = has || avail ? 1 : 0.38; g.stroke(); g.globalAlpha = 1;
-    if (id === tv.sel) { g.strokeStyle = '#ffffff'; g.lineWidth = 2; g.beginPath(); g.arc(n.x, n.y, R + 6, 0, Math.PI * 2); g.stroke(); }
-    if (n.name && tv.s > 0.45) { g.font = '11px Georgia, serif'; g.fillStyle = has ? '#fff6d8' : '#a89c88'; g.fillText(n.name, n.x, n.y + R + 5); }
+    if (id === tv.sel) { g.strokeStyle = '#ffffff'; g.lineWidth = 2; g.beginPath(); g.arc(n.x, n.y, R0 + 6, 0, Math.PI * 2); g.stroke(); }
+    if (n.name && tv.s > 0.45) { g.font = '11px Georgia, serif'; g.fillStyle = has ? '#fff6d8' : '#a89c88'; g.fillText(n.name, n.x, n.y + R0 + 5); }
   }
   g.font = '15px Georgia, serif';
   BRANCHES.forEach(b => { const k = TREE.nodes[b.id + 'K'], l = Math.hypot(k.x, k.y); g.fillStyle = b.color; g.globalAlpha = 0.75; g.fillText(b.name.toUpperCase(), k.x / l * (l + 58), k.y / l * (l + 58) - 8); g.globalAlpha = 1; });
@@ -306,18 +319,18 @@ function drawTree() {
 /* ---------- menu tab ---------- */
 function renderMenu() {
   el.pbody.className = 'notree';
-  travelSel = clamp(travelSel || S.zone, 1, S.maxZone);
-  const zi = zoneInfo(travelSel), as = S.opts.autoSell || 0;
-  const bonus = (zoneFind(zi.level) - 1) * 100, qty = (zoneQuantity(zi.level) - 1) * 100;
-  let h = '<h3>Travel <small>deepest zone reached: ' + S.maxZone + '</small></h3>';
-  h += '<div class="row"><button class="btn" data-act="zprev"' + (travelSel <= 1 ? ' disabled' : '') + '>◀</button><div style="flex:1;text-align:center"><b style="font-family:var(--serif);font-weight:400;color:var(--gold)">' + esc(zi.name) + '</b><br><span style="font-size:12px;color:var(--dim)">Monster level ' + zi.level + ' · ' + mobCount(zi.level) + ' monsters' + (travelSel === S.zone ? ' · you are here' : '') + '<br>Item rarity +' + Math.round(bonus) + '% · item quantity +' + Math.round(qty) + '%</span></div>' +
-    '<button class="btn" data-act="znext"' + (travelSel >= S.maxZone ? ' disabled' : '') + '>▶</button></div>';
-  h += '<div class="row" style="margin-top:8px;justify-content:center"><button class="btn pri" data-act="travel">' + (travelSel === S.zone ? 'Return to the zone entrance' : 'Travel') + '</button></div>';
-  h += '<div class="note" style="margin-top:8px">New zones are unlocked by finding the teleport at the edge of a map. Deeper zones have more and tougher monsters and better loot.</div>';
+  const as = S.opts.autoSell || 0;
+  let h = '';
+  if (screen === 'run' && R) {
+    h += '<h3>Current run <small>' + esc(G.zi.name) + '</small></h3><div class="stats"><div>Room<b>' + R.room + ' / ' + CH_ROOMS + '</b></div><div>Run level<b>' + R.lvl + '</b></div><div>Monsters slain<b>' + R.kills + '</b></div><div>Gold this run<b>' + fmt(S.gold - R.gold0) + '</b></div></div>';
+    const ids = Object.keys(R.abil);
+    h += '<h3>Abilities taken</h3>' + (ids.length ? ids.map(id => '<div class="gemrow have"><span class="ic">' + ABILITIES[id].icon + '</span><span class="tx"><b>' + esc(ABILITIES[id].name) + (R.abil[id] > 1 ? ' × ' + R.abil[id] : '') + '</b>' + esc(ABILITIES[id].desc) + '</span></div>').join('') : '<div class="note">None yet.</div>');
+    h += '<div class="row" style="margin-top:10px"><button class="btn danger" data-act="abandon">Abandon run</button></div>';
+  }
   h += '<h3>Auto-sell on pickup</h3><div class="row">' + ['Off', 'Normal', 'Normal + Magic'].map((t, i) => '<button class="btn' + (as === i ? ' pri' : '') + '" data-act="autosell" data-v="' + i + '">' + t + '</button>').join('') + '</div>';
-  h += '<h3>Record</h3><div class="stats"><div>Level<b>' + S.level + '</b></div><div>Monsters slain<b>' + fmt(S.stats.kills) + '</b></div><div>Deaths<b>' + S.stats.deaths + '</b></div><div>Bosses slain<b>' + (S.stats.bosses || 0) + '</b></div><div>' + SIGIL_NAME + 's<b>' + S.sigils + '</b></div><div>Gold<b>' + fmt(S.gold) + '</b></div></div>';
-  h += '<h3>How to play</h3><div class="note">Drag anywhere to move. Skills fire by themselves whenever an enemy is in sight. Monsters stand still until they see you.<br><br>Every zone is a closed map — the minimap in the corner fills in as you explore. Somewhere on it are <b>chests</b>, a portal to the boss <b>Arena</b>, and at the edge a <b>teleport</b> to the next, harder zone. Killed monsters and opened chests return after 10 minutes, the boss after 20.<br><br>Power comes from <b>items</b> with random modifiers, <b>skill gems</b> linked to support gems, and the <b>passive tree</b> (one point per level).</div>';
-  h += '<h3>' + esc(S.name) + ' <small>' + CLASSES[S.cls].name + '</small></h3><div class="row"><button class="btn" data-act="exit">Character select</button></div>';
+  h += '<h3>Record</h3><div class="stats"><div>Level<b>' + S.level + '</b></div><div>Chapters unlocked<b>' + S.maxCh + '</b></div><div>Monsters slain<b>' + fmt(S.stats.kills) + '</b></div><div>Bosses slain<b>' + (S.stats.bosses || 0) + '</b></div><div>Deaths<b>' + S.stats.deaths + '</b></div><div>Gold<b>' + fmt(S.gold) + '</b></div></div>';
+  h += '<h3>How to play</h3><div class="note">Drag anywhere to move. <b>Your skills attack only while you stand still</b>, so move to dodge and stop to fight.<br><br>A <b>chapter</b> is ' + CH_ROOMS + ' rooms; every 5th room holds a boss. Clear a room and the door at the top opens. If you die, the run ends — you keep your character levels, items, gold and gems, but lose the run\'s abilities.<br><br>During a run you pick <b>1 of 3 abilities</b> at the start, at each run level-up and after each boss. Between runs you grow stronger with <b>items</b>, <b>skill gems</b> and the <b>passive tree</b>.</div>';
+  if (screen !== 'run') h += '<h3>' + esc(S.name) + ' <small>' + CLASSES[S.cls].name + '</small></h3><div class="row"><button class="btn" data-act="exit">Character select</button></div>';
   h += '<div style="margin-top:18px;font-size:11px;color:#5a5248">Cindermarch' + (window.Android && Android.version ? ' ' + esc(Android.version()) : '') + ' · saves automatically on this device</div>';
   el.pbody.innerHTML = h;
 }
@@ -331,21 +344,19 @@ const ACT = {
   sell: () => { sellItem(sheetCtx.it); save(); closeSheet(); refreshTab(); },
   sellN: () => { const n = sellBelow(0); UI.toast(n ? 'Sold ' + n + ' item' + (n > 1 ? 's' : '') : 'Nothing to sell'); refreshTab(); },
   sellM: () => { const n = sellBelow(1); UI.toast(n ? 'Sold ' + n + ' item' + (n > 1 ? 's' : '') : 'Nothing to sell'); refreshTab(); },
-  sock: d => showSock(+d.slot, +d.sup),
-  pick: d => { socketGem(sheetCtx.slot, sheetCtx.sup, d.id); closeSheet(); refreshTab(); },
-  unsock: () => { unsocket(sheetCtx.slot, sheetCtx.sup); closeSheet(); refreshTab(); },
+  sock: d => showSock(+d.slot),
+  pick: d => { socketGem(sheetCtx.slot, d.id); closeSheet(); refreshTab(); },
+  unsock: () => { unsocket(sheetCtx.slot); closeSheet(); refreshTab(); },
   gem: d => showGem(d.id),
   sellGem: () => { sellGem(sheetCtx.gem); closeSheet(); refreshTab(); },
   offer: d => showOffer(+d.i),
   buy: () => { if (buyGem(sheetCtx.offer)) { UI.toast('Gem bought', '#58d8c8'); } closeSheet(); refreshTab(); },
   alloc: () => { if (allocate(tv.sel)) { treeInfo(); drawTree(); } },
   respec: () => { if (respec()) { UI.toast('Passive points refunded'); treeInfo(); drawTree(); } },
-  zprev: () => { travelSel--; refreshTab(); },
-  znext: () => { travelSel++; refreshTab(); },
-  travel: () => { computeStats(); if (travelSel === S.zone) resurrect(); else startZone(travelSel); save(); closePanel(); },
   autosell: d => { S.opts.autoSell = +d.v; save(); refreshTab(); },
-  locked: d => UI.toast('This support socket unlocks at level ' + d.lv),
   refresh: () => { if (refreshShop()) UI.toast('The trader has new gems', '#58d8c8'); refreshTab(); },
+  abandon: () => openSheet('<h3>Abandon this run?</h3><div class="note" style="margin-bottom:12px">You keep what you found, but the run and its abilities end here.</div><div class="row"><button class="btn danger" data-act="abandonYes">Abandon run</button><button class="btn" data-act="closeSheet">Keep going</button></div>'),
+  abandonYes: () => { closeSheet(); el.panel.classList.add('hidden'); panelTab = null; endRun(false, true); },
   exit: () => { closeSheet(); el.panel.classList.add('hidden'); panelTab = null; exitToTitle(); showTitle(); }
 };
 function onAct(e) {
@@ -354,15 +365,53 @@ function onAct(e) {
 }
 el.pbody.addEventListener('click', onAct);
 el.sheet.addEventListener('click', onAct);
-$('btns').addEventListener('click', e => { const b = e.target.closest('button'); if (b && G && !G.dead) openPanel(b.dataset.p); });
+// the pause button opens the panel where something new is waiting
+$('btns').addEventListener('click', e => {
+  if (!e.target.closest('button') || screen !== 'run' || !R || R.over || pickOpen) return;
+  openPanel(invNew ? 'inv' : gemsNew ? 'gems' : passivePoints() > 0 ? 'tree' : 'menu');
+});
 $('tabs').addEventListener('click', e => { const b = e.target.closest('button'); if (b) showTab(b.dataset.p); });
 $('pclose').addEventListener('click', closePanel);
-$('act').addEventListener('click', e => { const b = e.target.closest('[data-do]'); if (b && G && !paused) { doAction(b.dataset.do); hudCache = {}; } });
+
+/* ---------- the 1-of-3 ability choice ---------- */
+function showPick() {
+  pickOpen = true; paused = true; input.x = input.y = 0; joyEnd();
+  R.offer = R.offer || rollAbilities();
+  const title = R.why === 'start' ? 'Choose your first ability' : R.why === 'boss' ? 'Boss defeated!' : 'Run level ' + R.lvl + '!';
+  const sub = R.why === 'boss' ? 'You recover 30% life. Choose an ability:' : 'Choose an ability for this run:';
+  el.overlay.className = 'pick';
+  el.overlay.innerHTML = '<h2>' + title + '</h2><p>' + sub + '</p><div class="picks">' + R.offer.map(id => {
+    const a = ABILITIES[id], n = R.abil[id] || 0;
+    const fits = a.sup ? P.skills.filter(s => s && supportFits(a, s.def)).map(s => s.def.name) : [];
+    return '<button class="abil" data-ab="' + id + '"><i>' + a.icon + '</i><b>' + esc(a.name) + '</b>' + (n ? '<em>Taken ' + n + '× · ' + (a.max < 50 ? 'up to ' + a.max : 'no limit') + '</em>' : '') +
+      '<span>' + esc(a.desc) + '</span>' + (fits.length ? '<small>Improves ' + esc(fits.join(', ')) + '</small>' : '') + '</button>';
+  }).join('') + '</div>' + (R.picks > 1 ? '<p class="more">' + (R.picks - 1) + ' more to choose after this one</p>' : '');
+}
+el.overlay.addEventListener('click', e => {
+  const b = e.target.closest('[data-ab]');
+  if (!b || !pickOpen) return;
+  takeAbility(b.dataset.ab);
+  hudCache = {};
+  if (R.picks > 0) { showPick(); return; }
+  pickOpen = false; el.overlay.className = 'hidden'; el.overlay.innerHTML = ''; paused = false;
+});
+
+/* ---------- end of a run ---------- */
+function showEnd() {
+  pickOpen = false;
+  const won = R.won, rows = [['Chapter', esc(chapterInfo(R.ch).name)], ['Rooms cleared', R.cleared + ' / ' + CH_ROOMS + (R.newBest ? ' <em>new best</em>' : '')], ['Run level', R.lvl],
+    ['Monsters slain', R.kills], ['Gold', '+' + fmt(S.gold - R.gold0) + (R.bonus ? ' <em>incl. ' + fmt(R.bonus) + ' bonus</em>' : '')], ['Items found', R.items], ['Gems found', R.gems], ['Character level', S.level]];
+  el.overlay.className = won ? 'end won' : 'end';
+  el.overlay.innerHTML = '<h1>' + (won ? 'CHAPTER CLEARED' : R.abandoned ? 'RUN ABANDONED' : 'YOU DIED') + '</h1>' +
+    (won && R.unlocked ? '<p class="unlock">Chapter ' + (R.ch + 1) + ' · ' + esc(chapterInfo(R.ch + 1).name) + ' unlocked</p>' : '<p>' + (won ? 'Well fought.' : 'Everything you found is kept. The abilities of this run are gone.') + '</p>') +
+    '<div class="sum">' + rows.map(r => '<div><span>' + r[0] + '</span><b>' + r[1] + '</b></div>').join('') + '</div>' +
+    '<button class="btn pri big" data-camp="1">Back to camp</button>';
+}
 
 /* ---------- title screen, character select and character generator ---------- */
 function previewChar(cls) { return { cls, equip: { weapon: { slot: 'weapon', wtype: CLASSES[cls].wtype, ilvl: 1, rarity: 0 } } }; }
 function showTitle() {
-  paused = true; screen = 'title'; delArm = false;
+  paused = true; screen = 'title'; delArm = false; pickOpen = false;
   el.hud.classList.add('hidden');
   if (!SAVE.chars.length) { showGen(); return; }
   titleSel = clamp(titleSel, 0, SAVE.chars.length - 1);
@@ -371,7 +420,7 @@ function showTitle() {
   el.overlay.className = 'title';
   el.overlay.innerHTML = '<h1>CINDERMARCH</h1><canvas id="mdl"></canvas>' +
     '<div id="chars">' + SAVE.chars.map((ch, i) => '<button class="chr' + (i === titleSel ? ' on' : '') + '" data-char="' + i + '"><i>' + CLASSES[ch.cls].icon + '</i><b>' + esc(ch.name) + '</b><span>Lv ' + ch.level + ' ' + CLASSES[ch.cls].name + '</span></button>').join('') + '</div>' +
-    '<div id="tinfo"><b>' + esc(c.name) + '</b><span>Level ' + c.level + ' ' + C.name + '  ·  ' + esc(zoneInfo(c.zone).name) + '</span><small>Drag the figure to turn it</small></div>' +
+    '<div id="tinfo"><b>' + esc(c.name) + '</b><span>Level ' + c.level + ' ' + C.name + '  ·  Chapter ' + c.maxCh + '</span><small>Drag the figure to turn it</small></div>' +
     '<div class="tbtns"><button class="btn pri big" data-enter="1">Enter</button><button class="btn big" data-new="1"' + (SAVE.chars.length >= MAX_CHARS ? ' disabled' : '') + '>New character</button></div>' +
     '<button class="btn danger" id="tdel" data-del="1">Delete</button>';
 }
@@ -389,22 +438,38 @@ function showGen() {
     '<input id="cname" maxlength="14" autocomplete="off" spellcheck="false" placeholder="Name" value="' + esc(genName) + '">' +
     '<div class="tbtns">' + (SAVE.chars.length ? '<button class="btn big" data-back="1">Back</button>' : '') + '<button class="btn pri big" data-create="1">Create</button></div>';
 }
-function enterGame(i) {
-  selectChar(i);
-  travelSel = S.zone; invNew = gemsNew = false; hudCache = {};
-  screen = 'game'; mdlChar = null;
+// the camp between runs: pick a chapter, manage the character, start a run
+function showCamp() {
+  paused = true; screen = 'camp'; pickOpen = false;
+  el.hud.classList.add('hidden');
+  mdlChar = S;
+  const ch = S.chSel = clamp(S.chSel, 1, S.maxCh), zi = chapterInfo(ch), best = S.best[ch] || 0;
+  el.overlay.className = 'title camp';
+  el.overlay.innerHTML = '<div class="ctop"><button class="btn" data-chars="1">‹ Characters</button><span class="cgold">' + fmt(S.gold) + '</span></div>' +
+    '<div class="chead"><b>' + esc(S.name) + '</b><span>Level ' + S.level + ' ' + CLASSES[S.cls].name + '</span></div>' +
+    '<canvas id="mdl"></canvas>' +
+    '<div class="chap"><button class="btn" data-ch="-1"' + (ch <= 1 ? ' disabled' : '') + '>◀</button><div><small>Chapter ' + ch + '</small><b>' + esc(zi.name) + '</b><span>Monster level ' + chLevels(ch) + ' · ' + (best >= CH_ROOMS ? '✓ cleared' : 'best ' + best + ' / ' + CH_ROOMS) + '</span></div>' +
+    '<button class="btn" data-ch="1"' + (ch >= S.maxCh ? ' disabled' : '') + '>▶</button></div>' +
+    '<button class="btn pri big" id="startbtn" data-start="1">Start run</button>' +
+    '<div id="campbtns"><button data-p="inv">🎒<span>Items</span><b data-dot="inv"></b></button><button data-p="gems">💎<span>Skills</span><b data-dot="gems"></b></button><button data-p="tree">🌳<span>Passives</span><b data-dot="tree"></b></button><button data-p="menu">☰<span>Menu</span></button></div>';
+  dots();
+}
+function startRunUI() {
+  startRun(S.chSel);
+  screen = 'run'; mdlChar = null;
   el.overlay.className = 'hidden'; el.overlay.innerHTML = '';
   el.hud.classList.remove('hidden');
+  hudCache = {}; buildSkillBar();
   paused = false;
-  UI.toast('Drag anywhere to move', '#ffe9a0');
 }
+function backToCamp() { leaveRun(); hudCache = {}; showCamp(); }
 el.overlay.addEventListener('input', e => { if (e.target.id === 'cname') genName = e.target.value; });
 el.overlay.addEventListener('click', e => {
   const t = sel => e.target.closest(sel);
   let b;
-  if (t('[data-res]')) { resurrect(); el.overlay.className = 'hidden'; paused = false; hudCache = {}; return; }
+  if (t('[data-ab]')) return;
   if ((b = t('[data-char]'))) { titleSel = +b.dataset.char; showTitle(); return; }
-  if (t('[data-enter]')) { enterGame(titleSel); return; }
+  if (t('[data-enter]')) { selectChar(titleSel); invNew = gemsNew = false; showCamp(); return; }
   if ((b = t('[data-new]')) && !b.disabled) { genName = ''; showGen(); return; }
   if ((b = t('[data-del]'))) {
     if (!delArm) { delArm = true; b.textContent = 'Tap again to delete ' + SAVE.chars[titleSel].name; return; }
@@ -414,8 +479,13 @@ el.overlay.addEventListener('click', e => {
   if (t('[data-back]')) { showTitle(); return; }
   if (t('[data-create]')) {
     const name = (genName || '').trim().slice(0, 14) || pick(HERO_NAMES);
-    const i = createChar(genCls, name); genName = ''; titleSel = i; save(); enterGame(i);
+    const i = createChar(genCls, name); genName = ''; titleSel = i; save(); selectChar(i); showCamp(); return;
   }
+  if (t('[data-chars]')) { exitToTitle(); showTitle(); return; }
+  if ((b = t('[data-ch]')) && !b.disabled) { S.chSel += +b.dataset.ch; save(); showCamp(); return; }
+  if (t('[data-start]')) { startRunUI(); return; }
+  if ((b = t('#campbtns [data-p]'))) { openPanel(b.dataset.p); return; }
+  if (t('[data-camp]')) { backToCamp(); }
 });
 // drag the 3D figure to turn it
 el.overlay.addEventListener('pointerdown', e => { if (e.target.id === 'mdl') mdlDrag = { x: e.clientX, id: e.pointerId }; });
@@ -423,30 +493,36 @@ el.overlay.addEventListener('pointermove', e => { if (mdlDrag && e.pointerId ===
 const mdlEnd = () => { mdlDrag = null; };
 el.overlay.addEventListener('pointerup', mdlEnd); el.overlay.addEventListener('pointercancel', mdlEnd);
 
-window.pauseForNative = () => { if (G && S && !G.dead && !paused) openPanel('menu'); };
+window.pauseForNative = () => { if (screen === 'run' && R && !R.over && !paused) openPanel('menu'); };
 window.onAndroidBack = () => {
-  if (screen === 'gen' && SAVE.chars.length) { showTitle(); return true; }
-  if (screen !== 'game') return false;
+  if (screen === 'gen') { if (SAVE.chars.length) { showTitle(); return true; } return false; }
+  if (screen === 'title') return false;
   if (!el.sheet.classList.contains('hidden')) { closeSheet(); return true; }
   if (!el.panel.classList.contains('hidden')) { closePanel(); return true; }
-  if (G && S && !G.dead && !paused) { openPanel('menu'); return true; }
-  return false;
+  if (screen === 'camp') { exitToTitle(); showTitle(); return true; }
+  if (R && R.over) { backToCamp(); return true; }
+  if (pickOpen) return true;
+  openPanel('menu');
+  return true;
 };
 document.addEventListener('visibilitychange', () => { if (document.hidden) { save(); input.x = input.y = 0; joyEnd(); } });
 window.addEventListener('pagehide', save);
-setInterval(() => { if (G && !paused) save(); }, 20000);
+setInterval(() => { if (screen === 'run' && !paused) save(); }, 20000);
 document.addEventListener('contextmenu', e => e.preventDefault());
 
 let lastTs = 0;
 function frame(ts) {
   const dt = Math.min(0.05, Math.max(0, (ts - lastTs) / 1000)); lastTs = ts;
-  if (G && !paused && !G.dead) update(dt);
+  if (screen === 'run' && G && R && !paused && !R.over) update(dt);
   render();
-  if (G && S && screen === 'game') hudFrame();
-  if (screen !== 'game' && mdlChar) {
+  if (screen === 'run' && G && R && !R.over) {
+    hudFrame();
+    if (R.picks > 0 && !pickOpen && el.panel.classList.contains('hidden')) showPick();
+  }
+  if ((screen === 'title' || screen === 'gen' || screen === 'camp') && mdlChar) {
     const c = $('mdl');
     if (!mdlDrag) mdlAng += dt * 0.5;
-    if (c) Model.draw(c, mdlChar, mdlAng, screen === 'title' ? 0.74 : 1);
+    if (c) Model.draw(c, mdlChar, mdlAng, screen === 'title' ? 0.74 : screen === 'camp' ? 0.8 : 1);
   }
   requestAnimationFrame(frame);
 }

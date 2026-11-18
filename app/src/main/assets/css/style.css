@@ -12,25 +12,25 @@ button { font: inherit; color: inherit; background: none; border: 0; padding: 0;
 
 /* ---------- HUD ---------- */
 #hud { position: fixed; inset: 0; pointer-events: none; }
-#top { position: absolute; top: 8px; left: 128px; right: 10px; display: flex; align-items: flex-start; justify-content: space-between; gap: 10px; }
-#zonebox { flex: 1; max-width: 240px; }
+#top { position: absolute; top: 8px; left: 10px; right: 62px; display: flex; align-items: flex-start; justify-content: space-between; gap: 10px; }
+#zonebox { flex: 1; max-width: 300px; }
 #zname { font-family: var(--serif); font-size: 15px; letter-spacing: .04em; color: var(--gold); text-shadow: 0 1px 3px #000; }
 .bar { position: relative; height: 12px; background: #0008; border: 1px solid var(--line); border-radius: 2px; overflow: hidden; }
-.bar i { position: absolute; inset: 0 auto 0 0; width: 0; background: linear-gradient(#b8742e, #7a4416); }
+.bar i { position: absolute; inset: 0 auto 0 0; width: 0; background: linear-gradient(#8a6ad8, #4a2c8a); transition: width .15s; }
 .bar span { position: absolute; inset: 0; font-size: 9px; line-height: 11px; text-align: center; color: #fff; text-shadow: 0 1px 2px #000; }
 #gold { font-size: 13px; color: var(--gold); text-shadow: 0 1px 3px #000; font-variant-numeric: tabular-nums; padding-top: 2px; }
 #gold::before { content: '● '; color: #f0b830; }
 #zinfo { font-size: 10.5px; color: #c8bfae; text-shadow: 0 1px 2px #000; margin-top: 3px; font-variant-numeric: tabular-nums; }
-#bossbar { position: absolute; top: 128px; left: 12%; right: 12%; text-align: center; }
+#bossbar { position: absolute; top: 96px; left: 12%; right: 12%; text-align: center; }
 #bname { font-family: var(--serif); font-size: 14px; color: #ff9a7a; text-shadow: 0 1px 3px #000; margin-bottom: 2px; }
 #bossbar .bar { height: 10px; border-color: #7a2a1e; }
 #bossbar .bar i { background: linear-gradient(#e0402c, #8a1a10); }
-#btns { position: absolute; right: 8px; top: 170px; display: flex; flex-direction: column; gap: 8px; pointer-events: auto; }
-#btns button { position: relative; width: 44px; height: 44px; font-size: 20px; background: #1a1614cc; border: 1px solid var(--line); border-radius: 6px; }
+#btns { position: absolute; right: 8px; top: 8px; display: flex; gap: 8px; pointer-events: auto; }
+#btns button { position: relative; width: 44px; height: 44px; font-size: 15px; letter-spacing: -2px; color: var(--gold); background: #1a1614cc; border: 1px solid var(--line); border-radius: 6px; }
 #btns button:active { background: #3a2c1e; }
-#btns b { position: absolute; top: -4px; right: -4px; min-width: 16px; height: 16px; padding: 0 3px; border-radius: 8px; background: var(--ember); color: #1a0d04; font-size: 10px; line-height: 16px; font-weight: 700; display: none; }
-#btns b.on { display: block; }
-#toasts { position: absolute; top: 172px; left: 0; right: 60px; display: flex; flex-direction: column; align-items: center; gap: 4px; }
+#btns b, #campbtns b { position: absolute; top: -4px; right: -4px; min-width: 16px; height: 16px; padding: 0 3px; border-radius: 8px; background: var(--ember); color: #1a0d04; font-size: 10px; line-height: 16px; font-weight: 700; display: none; }
+#btns b.on, #campbtns b.on { display: block; }
+#toasts { position: absolute; top: 140px; left: 0; right: 0; display: flex; flex-direction: column; align-items: center; gap: 4px; }
 .toast { padding: 3px 10px; background: #000a; border: 1px solid #fff2; border-radius: 3px; font-size: 12px; text-shadow: 0 1px 2px #000; animation: toast 2.6s forwards; }
 @keyframes toast { 0% { opacity: 0; transform: translateY(6px); } 8%, 80% { opacity: 1; transform: none; } 100% { opacity: 0; } }
 #bottom { position: absolute; left: 10px; right: 10px; bottom: 14px; display: flex; align-items: flex-end; gap: 10px; }
@@ -133,11 +133,6 @@ h3 small { font: 12px system-ui, sans-serif; color: var(--dim); }
 #overlay .starter span { font-size: 12px; color: var(--dim); }
 #overlay.death h1 { color: #c8362a; text-shadow: 0 0 24px #b3221c88; }
 
-/* ---------- action buttons (portals, sigil) ---------- */
-#act { position: absolute; left: 0; right: 0; bottom: 112px; display: flex; flex-direction: column; align-items: center; gap: 8px; pointer-events: none; }
-#act .btn { pointer-events: auto; min-width: 190px; font-size: 15px; padding: 12px 18px; box-shadow: 0 4px 16px #000a; animation: pulse 1.4s infinite; }
-#act .btn.sigil { border-color: #ff5ad0; color: #ffd0f2; background: #3a1230; }
-@keyframes pulse { 50% { box-shadow: 0 4px 22px #e0803a99; } }
 .note { font-size: 12.5px; color: var(--dim); line-height: 1.45; }
 .note b { color: var(--text); font-weight: 500; }
 .hint { font-size: 11.5px; color: var(--dim); flex: 1; min-width: 120px; }
@@ -182,3 +177,59 @@ h3 small { font: 12px system-ui, sans-serif; color: var(--dim); }
 #cname:focus { outline: none; border-color: var(--ember); }
 #overlay.gen .tbtns { position: static; }
 #overlay.death { display: flex; }
+
+/* ---------- run HUD extras ---------- */
+#abil { display: flex; flex-wrap: wrap; gap: 3px; margin-top: 5px; }
+#abil span { position: relative; width: 24px; height: 24px; display: flex; align-items: center; justify-content: center; font-size: 14px; background: #000a; border: 1px solid var(--line); border-radius: 4px; }
+#abil b { position: absolute; right: -3px; bottom: -4px; font-size: 9px; color: #fff; background: #4a2c8a; border-radius: 6px; padding: 0 3px; line-height: 12px; }
+#panel { z-index: 20; }
+#overlay { z-index: 10; }
+.gemrow.have { border-color: #6a5ad0; }
+.gemrow .tx i { font-style: normal; font-size: 11px; color: #8a7f70; }
+.gemrow:not(button) { cursor: default; }
+
+/* ---------- 1 of 3 ability choice ---------- */
+#overlay.pick { background: radial-gradient(circle at 50% 35%, #2a1c3aee, #0d0b0af2 70%); justify-content: center; }
+#overlay.pick h2 { font-family: var(--serif); font-weight: 400; font-size: 26px; color: var(--gold); margin: 0; letter-spacing: .04em; }
+#overlay.pick p { margin: 6px 0 16px; }
+#overlay.pick p.more { margin-top: 12px; font-size: 12px; }
+.picks { display: flex; flex-direction: column; gap: 10px; width: 100%; max-width: 380px; }
+.abil { display: grid; grid-template-columns: 46px 1fr; column-gap: 12px; text-align: left; padding: 12px; border: 1px solid #6a5ad0; border-radius: 8px; background: linear-gradient(#241c34, #17121f); box-shadow: 0 4px 18px #0008; }
+.abil:active { border-color: var(--gold); transform: scale(.98); }
+.abil i { grid-row: 1 / 6; font-style: normal; font-size: 34px; align-self: center; text-align: center; }
+.abil b { font-family: var(--serif); font-weight: 400; font-size: 17px; color: #ffd9b0; }
+.abil em { font-style: normal; font-size: 11px; color: #b8a8ff; }
+.abil span { font-size: 13px; color: var(--text); margin-top: 2px; }
+.abil small { font-size: 11px; color: var(--gem); margin-top: 3px; }
+
+/* ---------- end of run ---------- */
+#overlay.end { justify-content: center; }
+#overlay.end h1 { color: #c8362a; text-shadow: 0 0 24px #b3221c88; font-size: 32px; }
+#overlay.end.won h1 { color: var(--gold); text-shadow: 0 0 24px #e8c46a88; }
+#overlay.end p.unlock { color: #9fe6ff; font-size: 15px; }
+.sum { width: 100%; max-width: 320px; margin-bottom: 22px; font-size: 13.5px; }
+.sum div { display: flex; justify-content: space-between; padding: 6px 2px; border-bottom: 1px dotted #3a3026; color: var(--dim); }
+.sum b { color: var(--text); font-weight: 500; text-align: right; }
+.sum em { font-style: normal; color: var(--gold); font-size: 11px; margin-left: 4px; }
+
+/* ---------- camp ---------- */
+#overlay.camp { display: flex; flex-direction: column; align-items: center; padding: 10px 14px 18px; overflow-y: auto; touch-action: pan-y; }
+.ctop { width: 100%; display: flex; justify-content: space-between; align-items: center; }
+.ctop .btn { min-height: 34px; padding: 6px 10px; font-size: 12px; }
+.cgold { color: var(--gold); font-size: 14px; }
+.cgold::before { content: '● '; color: #f0b830; }
+.chead { text-align: center; margin-top: 4px; }
+.chead b { display: block; font-family: var(--serif); font-weight: 400; font-size: 24px; color: var(--gold); }
+.chead span { font-size: 13px; color: var(--dim); }
+#overlay.camp #mdl { position: static; width: 100%; max-width: 420px; flex: 1 1 180px; min-height: 170px; touch-action: none; }
+.chap { display: flex; align-items: center; gap: 8px; width: 100%; max-width: 380px; margin: 6px 0 12px; }
+.chap > div { flex: 1; text-align: center; padding: 8px 4px; border: 1px solid var(--line); border-radius: 6px; background: var(--stone); }
+.chap small { display: block; font-size: 11px; color: var(--dim); text-transform: uppercase; letter-spacing: .1em; }
+.chap b { display: block; font-family: var(--serif); font-weight: 400; font-size: 18px; color: #ffd9b0; }
+.chap span { font-size: 11.5px; color: var(--dim); }
+.chap .btn { min-width: 44px; }
+#startbtn { min-width: 220px; font-size: 19px; padding: 15px 18px; margin-bottom: 14px; }
+#campbtns { display: flex; gap: 8px; width: 100%; max-width: 380px; }
+#campbtns button { position: relative; flex: 1; display: flex; flex-direction: column; align-items: center; gap: 2px; padding: 9px 4px; font-size: 22px; border: 1px solid var(--line); border-radius: 6px; background: var(--stone); }
+#campbtns button span { font-size: 11px; color: var(--dim); }
+#campbtns button:active { background: #3a2c1e; }

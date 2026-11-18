@@ -2,16 +2,15 @@
 /* ===== state ===== */
 const SAVE_KEY = 'cindermarch_v2', OLD_SAVE_KEY = 'cindermarch_v1';
 const LEVEL_CAP = 80, PLAYER_R = 11, MAX_CHARS = 8;
-const MOB_RESET = 10 * 60 * 1000;    // slain monsters and opened chests come back
-const BOSS_RESET = 20 * 60 * 1000;   // the arena boss comes back
 let SAVE = null;   // everything that is stored: all characters
 let S = null;      // the character being played
 let P = null;      // its computed stats
-let G = null;      // runtime state of the current zone
+let R = null;      // the current run: chapter, room, run level, abilities picked
+let G = null;      // the current room
 const VIEW = { w: 420, h: 800 };   // logical view size, set by render.js
 const input = { x: 0, y: 0 };
 let statsDirty = false;
-const UI = { toast() {}, onLevel() {}, onDeath() {}, onZone() {}, onLoot() {} };   // filled in by ui.js
+const UI = { toast() {}, onLevel() {}, onDeath() {}, onRoom() {}, onLoot() {}, onClear() {}, onRunEnd() {} };   // filled in by ui.js
 
 function save() {
   if (!SAVE) return;
@@ -26,10 +25,16 @@ function fixChar(c) {
   c.name = c.name || 'Exile';
   c.opts = c.opts || { autoSell: 0 };
   c.stats = c.stats || { kills: 0, deaths: 0 };
-  c.shop = c.shop || [];
-  c.zs = c.zs || {};
-  c.sigils = c.sigils || 0;
-  delete c.v;
+  c.shop = c.shop && c.shop.every(o => o && o.gem && !o.gem.sup) ? c.shop : [];
+  // chapters replace the old zones: three zones' worth of difficulty per chapter
+  c.maxCh = c.maxCh || Math.max(1, Math.ceil((c.maxZone || 1) / 3));
+  c.chSel = clamp(c.chSel || c.maxCh, 1, c.maxCh);
+  c.best = c.best || {};
+  // support gems are run abilities now: refund them
+  const sup = c.gems.filter(g => g.sup);
+  if (sup.length) { c.gold += 60 * sup.length; c.gems = c.gems.filter(g => !g.sup); }
+  c.slots = c.slots.map(s => ({ skill: s && c.gems.some(g => g.uid === s.skill) ? s.skill : null }));
+  delete c.v; delete c.zone; delete c.maxZone; delete c.zs; delete c.sigils;
 }
 function loadSave() {
   SAVE = null;
@@ -42,15 +47,15 @@ function loadSave() {
     }
   } catch (e) { SAVE = null; }
   if (!SAVE) SAVE = { v: 2, chars: [], sel: 0 };
-  SAVE.chars = SAVE.chars.filter(c => c && c.slots && c.tree && c.equip);
+  SAVE.chars = SAVE.chars.filter(c => c && c.slots && c.tree && c.equip && c.gems);
   SAVE.chars.forEach(fixChar);
   SAVE.sel = clamp(SAVE.sel | 0, 0, Math.max(0, SAVE.chars.length - 1));
 }
 function createChar(cls, name) {
   const C = CLASSES[cls];
   const c = { id: uid(), cls, name: name || pick(HERO_NAMES), level: 1, xp: 0, gold: 0, inv: [], equip: {}, gems: [],
-    slots: [0, 1, 2, 3].map(() => ({ skill: null, sup: [null, null, null] })),
-    tree: ['start'], zone: 1, maxZone: 1, shop: [], opts: { autoSell: 0 }, stats: { kills: 0, deaths: 0 }, zs: {}, sigils: 0 };
+    slots: [0, 1, 2, 3].map(() => ({ skill: null })), tree: ['start'], maxCh: 1, chSel: 1, best: {}, shop: [],
+    opts: { autoSell: 0 }, stats: { kills: 0, deaths: 0 } };
   const g = makeGem(C.skill);
   c.gems.push(g); c.slots[0].skill = g.uid;
   c.equip.weapon = makeItem(1, { slot: 'weapon', rarity: 0, wtype: C.wtype });
@@ -58,31 +63,26 @@ function createChar(cls, name) {
   return SAVE.chars.length - 1;
 }
 function selectChar(i) {
-  S = SAVE.chars[i]; SAVE.sel = i;
+  S = SAVE.chars[i]; SAVE.sel = i; R = null; G = null;
   if (!S.shop.length) rollShop();
   computeStats();
-  startZone(S.zone);
   save();
 }
 function deleteChar(i) { SAVE.chars.splice(i, 1); SAVE.sel = clamp(SAVE.sel, 0, Math.max(0, SAVE.chars.length - 1)); save(); }
-function exitToTitle() { save(); S = null; P = null; G = null; input.x = input.y = 0; }
+function exitToTitle() { save(); S = null; P = null; R = null; G = null; input.x = input.y = 0; }
 
 /* ===== character stats ===== */
 const gemById = id => id ? S.gems.find(g => g.uid === id) : null;
 const slotUnlocked = i => S.level >= SLOT_UNLOCK[i];
-const SUPPORT_UNLOCK = [1, 8, 16];
-const supportSockets = () => Math.min(3, 1 + Math.floor(S.level / 8));
 const passivePoints = () => S.level - 1 - (S.tree.length - 1);
-function gemSocketed(id) {
-  for (let i = 0; i < 4; i++) { const s = S.slots[i]; if (s.skill === id) return { slot: i, sup: -1 }; const j = s.sup.indexOf(id); if (j >= 0) return { slot: i, sup: j }; }
-  return null;
-}
+function gemSocketed(id) { for (let i = 0; i < 4; i++) if (S.slots[i].skill === id) return { slot: i }; return null; }
 function computeStats() {
   const st = {};
-  const add = src => { for (const k in src) st[k] = (st[k] || 0) + src[k]; };
+  const add = (src, n) => { for (const k in src) st[k] = (st[k] || 0) + src[k] * (n || 1); };
   add(CLASSES[S.cls].stats);
   for (const sl of EQUIP_SLOTS) if (S.equip[sl]) add(itemStats(S.equip[sl]));
   for (const id of S.tree) { const n = TREE.nodes[id]; if (n) add(n.stats); }
+  if (R) for (const id in R.abil) { const a = ABILITIES[id]; if (a.stats) add(a.stats, R.abil[id]); }
   const g = k => st[k] || 0;
   const p = { raw: st };
   p.maxLife = Math.max(10, Math.round((80 + 10 * (S.level - 1) + g('life')) * (1 + g('lifePct') / 100)));
@@ -103,6 +103,7 @@ function computeStats() {
   if (G && G.player) G.player.life = Math.min(G.player.life, p.maxLife);
   statsDirty = false;
 }
+// abilities picked during the run change every skill they fit, the way support gems used to
 function skillInfo(i) {
   const sl = S.slots[i];
   if (!slotUnlocked(i) || !sl.skill) return null;
@@ -110,23 +111,22 @@ function skillInfo(i) {
   const d = SKILLS[gem.id], l = gem.lvl, st = P.raw, g = k => st[k] || 0;
   let more = 1 + g('moreDmg') / 100, cdm = 1, area = P.area, proj = 0, pierce = d.pierce || 0, chain = d.chain || 0;
   let crit = P.crit, cm = P.critMulti, leech = P.leech, ignite = 0, echo = 0;
-  const sups = [], n = supportSockets();
-  for (let j = 0; j < n; j++) {
-    const sg = gemById(sl.sup[j]); if (!sg) continue;
-    const sd = SUPPORTS[sg.id]; if (!sd || !supportFits(sd, d)) continue;
+  const sups = [];
+  if (R) for (const id in R.abil) {
+    const sd = ABILITIES[id], n = R.abil[id];
+    if (!sd.sup || !supportFits(sd, d)) continue;
     sups.push(sd);
-    const bonus = 0.008 * (sg.lvl - 1);
-    if (sd.more) more *= sd.more + bonus; else more *= 1 + bonus;
-    if (sd.cd) cdm *= sd.cd;
-    if (sd.area) area *= sd.area;
-    if (sd.proj) proj += sd.proj;
-    if (sd.pierce) pierce += sd.pierce;
-    if (sd.chain) chain += sd.chain;
-    if (sd.crit) crit += sd.crit;
-    if (sd.critMulti) cm += sd.critMulti;
-    if (sd.leech) leech += sd.leech;
-    if (sd.ignite) ignite += sd.ignite;
-    if (sd.echo) echo = 1;
+    if (sd.more) more *= sd.more < 1 ? sd.more : Math.pow(sd.more, n);   // a penalty is paid once, a bonus stacks
+    if (sd.cd) cdm *= sd.cd < 1 ? Math.pow(sd.cd, n) : sd.cd;
+    if (sd.area) area *= Math.pow(sd.area, n);
+    if (sd.proj) proj += sd.proj * n;
+    if (sd.pierce) pierce += sd.pierce * n;
+    if (sd.chain) chain += sd.chain * n;
+    if (sd.crit) crit += sd.crit * n;
+    if (sd.critMulti) cm += sd.critMulti * n;
+    if (sd.leech) leech += sd.leech * n;
+    if (sd.ignite) ignite += sd.ignite * n;
+    if (sd.echo) echo = n;
   }
   const isAtk = d.tags.includes('attack');
   if (isAtk) more *= 1 + g('moreAtk') / 100;
@@ -140,7 +140,7 @@ function skillInfo(i) {
   for (const t in dmg) { dmg[t] *= Math.max(0.1, 1 + (incG + inc[t]) / 100) * more * (t === 'fire' ? 1 + g('moreFire') / 100 : 1); avg += dmg[t]; }
   const cd = Math.max(0.12, d.cd * cdm / P.skillSpeed);
   crit = clamp(crit, 0, 100);
-  let dps = avg * (1 + crit / 100 * (cm / 100 - 1)) / cd * (1 + ignite) * (echo ? 2 : 1);
+  let dps = avg * (1 + crit / 100 * (cm / 100 - 1)) / cd * (1 + ignite) * (1 + echo);
   if (d.kind === 'bolt') dps *= 1 + proj * 0.5;
   return { i, def: d, gem, cd, dmg, avg, crit, critMulti: cm, area, proj, pierce, chain, leech, ignite, echo, sups, dps };
 }
@@ -148,195 +148,202 @@ function rollShop() {
   S.shop = [];
   const owned = new Set(S.gems.map(g => g.id));
   for (let i = 0; i < 3; i++) {
-    let g = randomGem(i === 0 ? 0.25 : 0.7), tries = 0;
-    while ((owned.has(g.id) || S.shop.some(o => o.gem.id === g.id)) && tries++ < 8) g = randomGem(i === 0 ? 0.25 : 0.7);
-    S.shop.push({ gem: g, price: Math.round((g.sup ? 90 : 140) * (1 + 0.35 * (S.maxZone - 1))) });
+    let g = randomGem(), tries = 0;
+    while ((owned.has(g.id) || S.shop.some(o => o.gem.id === g.id)) && tries++ < 12) g = randomGem();
+    S.shop.push({ gem: g, price: Math.round(140 * (1 + 0.9 * (S.maxCh - 1))) });
   }
 }
-const refreshCost = () => Math.round(40 * (1 + 0.35 * (S.maxZone - 1)));
+const refreshCost = () => Math.round(40 * (1 + 0.9 * (S.maxCh - 1)));
 function refreshShop() { const c = refreshCost(); if (S.gold < c) return false; S.gold -= c; rollShop(); save(); return true; }
 
-/* ===== zone: a bounded map plus its boss arena ===== */
-const AREA_KEYS = ['W', 'H', 'grid', 'mobs', 'projs', 'eprojs', 'fx', 'drops', 'texts', 'delayed', 'portals', 'chests', 'seen', 'reveal', 'flow'];
-const FLOW_Q = new Int32Array(84 * 84 + 16);
-// what is remembered about a zone between visits: its layout, who is dead, which chests are open, when the boss died
-function zoneState(z) {
-  const now = Date.now();
-  for (const k in S.zs) {
-    const o = S.zs[k];
-    if (+k !== z && now - o.t >= MOB_RESET && (!o.boss || now - o.boss >= BOSS_RESET)) delete S.zs[k];
-  }
-  let st = S.zs[z];
-  if (st && now - st.t >= MOB_RESET) {
-    if (!st.boss || now - st.boss >= BOSS_RESET) st = null;       // nothing left to remember: a fresh layout
-    else { st.dead = []; st.ch = []; st.t = now; }
-  }
-  if (!st) st = S.zs[z] = { seed: Math.floor(Math.random() * 2147483647), t: now, dead: [], ch: [], boss: 0 };
-  if (st.boss && now - st.boss >= BOSS_RESET) st.boss = 0;
-  return st;
+/* ===== the run ===== */
+function startRun(ch) {
+  ch = clamp(ch, 1, S.maxCh);
+  S.chSel = ch;
+  R = { ch, room: 1, lvl: 1, xp: 0, abil: {}, picks: 1, why: 'start', offer: null, kills: 0, gold0: S.gold, items: 0, gems: 0, t0: Date.now(), over: false };
+  computeStats();
+  startRoom(true);
+  G.player.life = P.maxLife;
+  save();
 }
-function makeArea(g, portals) {
-  return { W: g.W, H: g.H, grid: g.grid, mobs: [], projs: [], eprojs: [], fx: [], drops: [], texts: [], delayed: [], portals, chests: [],
-    seen: new Uint8Array(g.W * g.H), reveal: [], flow: new Int16Array(g.W * g.H), start: g.start };
+function startRoom(first) {
+  const L = roomLevel(R.ch, R.room), life = G && !first ? G.player.life : P.maxLife;
+  const room = genRoom(Math.floor(Math.random() * 2147483647), R.ch, R.room);
+  G = { zi: Object.assign(chapterInfo(R.ch), { level: L }), t: 0, W: room.W, H: room.H, grid: room.grid, door: DOOR_X,
+    mobs: [], projs: [], eprojs: [], fx: [], drops: [], texts: [], delayed: [], cds: [0, 0, 0, 0], shake: 0, dead: false,
+    cleared: false, flow: new Int16Array(room.W * room.H), flowT: 0, boss: isBossRoom(R.room),
+    player: { x: START.x, y: START.y, life: Math.min(life, P.maxLife), face: -Math.PI / 2, walk: 0, flash: 0, blink: 0, castT: -9, hurt: 0 } };
+  for (const sp of room.spawns) spawnMob(sp);
+  UI.onRoom();
 }
-function bindArea(name) { G.area = name; const a = G.areas[name]; for (const k of AREA_KEYS) G[k] = a[k]; G.lastTile = -1; G.flowT = 0; G.near = null; }
-function startZone(z) {
-  S.zone = z;
-  const zs = zoneState(z), m = genMap(zs.seed, z), ar = genArena();
-  const map = makeArea(m, [{ kind: 'arena', x: m.arena.x, y: m.arena.y, seen: false }, { kind: 'exit', x: m.exit.x, y: m.exit.y, seen: false }]);
-  map.defs = m.mobs;
-  const arena = makeArea(ar, [{ kind: 'leave', x: ar.exit.x, y: ar.exit.y, seen: true }]);
-  arena.bossAt = ar.boss;
-  G = { zi: zoneInfo(z), zs, t: 0, area: 'map', areas: { map, arena }, cds: [0, 0, 0, 0], shake: 0, dead: false, near: null, tickT: 0, flowT: 0, lastTile: -1,
-    player: { x: m.start.x, y: m.start.y, life: P.maxLife, face: -Math.PI / 2, walk: 0, flash: 0, blink: 0, castT: -9 } };
-  const dead = new Set(zs.dead), open = new Set(zs.ch);
-  m.chests.forEach((c, i) => map.chests.push({ x: c.x, y: c.y, tier: c.tier, idx: i, open: open.has(i), seen: false }));
-  m.mobs.forEach((d, i) => { if (!dead.has(i)) spawnMob(map, d, i); });
-  if (!zs.boss) spawnBoss();
-  bindArea('map');
-  explore();
-  UI.onZone();
-}
-function spawnMob(area, def, idx, boss) {
-  const d = MOBS[def.type], L = G ? G.zi.level : S.zone, rar = def.rar || 0;
-  const m = { type: def.type, x: def.x, y: def.y, sx: def.x, sy: def.y, idx, pack: def.pack, r: d.r, spd: d.spd * rnd(0.9, 1.1), hp: mobHp(L) * d.hp, dmg: mobDmg(L) * d.dmg, xp: mobXp(L) * d.xp, rar,
-    color: d.color, atkT: rnd(0.4, 1.1), chill: 0, burn: 0, burnT: 0, flash: 0, orbT: 0, mods: [], wob: rnd(0, 6.28), ranged: !!d.ranged, name: d.name, dead: false, lunge: 0, awake: false, losT: 0, see: false };
+function spawnMob(sp) {
+  const L = G.zi.level;
+  if (sp.type === 'boss') return spawnBoss(sp, L);
+  const d = MOBS[sp.type], rar = sp.rar || 0;
+  let x = sp.x, y = sp.y;
+  if (!walk(x, y)) { x = (Math.floor(x / TILE) + 0.5) * TILE; y = (Math.floor(y / TILE) + 0.5) * TILE; }
+  const m = { type: sp.type, x, y, r: d.r, spd: d.spd * rnd(0.9, 1.1), hp: mobHp(L) * d.hp * chHp(R.ch), dmg: mobDmg(L) * d.dmg * chDmg(R.ch), xp: mobXp(L) * d.xp, rar,
+    color: d.color, atkT: rnd(0.8, 1.8), chill: 0, burn: 0, burnT: 0, flash: 0, orbT: 0, mods: [], wob: rnd(0, 6.28), name: d.name, dead: false, lunge: 0,
+    ranged: !!d.ranged, totem: !!d.totem, charge: !!d.charge, st: 'walk', stT: rnd(1.5, 3), ang: 0, losT: 0, see: false };
   const mk = Object.keys(MOB_MODS);
-  if (rar === 1) { m.hp *= 2.2; m.xp *= 2.5; m.mods = [pick(mk)]; }
-  if (rar === 2) { m.hp *= 5; m.xp *= 6; m.r *= 1.25; m.dmg *= 1.2; const a = pick(mk); m.mods = [a, pick(mk.filter(k => k !== a))]; }
-  for (const mod of m.mods) { if (mod === 'fast') m.spd *= 1.35; if (mod === 'tough') m.hp *= 1.6; if (mod === 'deadly') m.dmg *= 1.4; }
+  if (rar === 1) { m.hp *= 2; m.xp *= 2.5; m.mods = [pick(mk)]; }
+  if (rar === 2) { m.hp *= 4; m.xp *= 6; m.r *= 1.2; m.dmg *= 1.2; const a = pick(mk); m.mods = [a, pick(mk.filter(k => k !== a))]; }
+  for (const mod of m.mods) { if (mod === 'fast') m.spd *= 1.3; if (mod === 'tough') m.hp *= 1.5; if (mod === 'deadly') m.dmg *= 1.35; }
   if (rar) m.name = m.mods.map(k => MOB_MODS[k]).join(' ') + ' ' + d.name;
-  if (boss) { m.boss = true; m.name = zoneInfo(L).boss; m.hp = mobHp(L) * (14 + 4 * Math.min(L, 19)); m.dmg = mobDmg(L) * 2; m.r = 30; m.spd = 64; m.xp = mobXp(L) * 30; m.rar = 3; m.novaT = 4; m.sumT = 7; m.mods = []; }
   m.maxHp = m.hp;
-  area.mobs.push(m);
+  G.mobs.push(m);
   return m;
 }
-function spawnBoss() {
-  const a = G ? G.areas.arena : null; if (!a) return;
-  spawnMob(a, { type: 'brute', x: a.bossAt.x, y: a.bossAt.y }, undefined, true);
+function spawnBoss(sp, L) {
+  const fin = sp.final, B = fin ? { name: G.zi.boss, color: BOSS_COLOR[G.zi.el] || '#8a4a3a', pats: ['ring', 'dash', 'spiral', 'fan', 'summon'], spd: 60 } : MINI_BOSSES[sp.idx % MINI_BOSSES.length];
+  const m = { type: 'boss', boss: true, final: fin, x: sp.x, y: sp.y, r: fin ? 32 : 26, spd: B.spd, pats: B.pats, pi: 0, name: B.name, color: B.color,
+    hp: mobHp(L) * chHp(R.ch) * (fin ? 24 + 3 * R.ch : 10 + 2 * R.ch), dmg: mobDmg(L) * chDmg(R.ch) * (fin ? 1.8 : 1.5), xp: mobXp(L) * (fin ? 40 : 20), rar: 3,
+    atkT: 1, chill: 0, burn: 0, burnT: 0, flash: 0, orbT: 0, mods: [], wob: 0, dead: false, lunge: 0, st: 'idle', stT: 1.6, ang: 0, emitT: 0, n: 0, losT: 0, see: false };
+  m.maxHp = m.hp;
+  G.mobs.push(m);
+  return m;
 }
-const arenaBoss = () => G.areas.arena.mobs.find(m => m.boss && !m.dead) || null;
-const bossWait = () => G.zs.boss ? Math.max(0, BOSS_RESET - (Date.now() - G.zs.boss)) : 0;
-const mobWait = () => Math.max(0, MOB_RESET - (Date.now() - G.zs.t));
-function resetArena() {
-  const a = G.areas.arena;
-  for (let i = a.mobs.length - 1; i >= 0; i--) if (!a.mobs[i].boss) a.mobs.splice(i, 1);
-  a.eprojs.length = 0; a.projs.length = 0; a.delayed.length = 0;
-  const b = arenaBoss();
-  if (b) { b.hp = b.maxHp; b.awake = false; b.x = a.bossAt.x; b.y = a.bossAt.y; b.burn = 0; b.burnT = 0; b.chill = 0; b.novaT = 4; b.sumT = 7; }
+const bossMob = () => G && G.mobs.find(m => m.boss && !m.dead) || null;
+// leaving through the door: loot still lying around is picked up on the way out
+function collectAll() {
+  for (const d of G.drops) pickUp(d, true);
+  G.drops.length = 0;
 }
-function enterArea(name, x, y) {
-  bindArea(name);
-  G.player.x = x; G.player.y = y; G.player.blink = 0.3;
-  input.x = input.y = 0;
-  explore();
+function nextRoom() {
+  collectAll();
+  if (R.room >= CH_ROOMS) { endRun(true); return; }
+  R.room++;
+  startRoom(false);
+  save();
 }
-// timers that run on the real clock, so they keep counting while the game is closed
-function zoneTick() {
-  const now = Date.now(), zs = G.zs, map = G.areas.map, pl = G.player;
-  if (now - zs.t >= MOB_RESET) {
-    zs.t = now;
-    const inMap = G.area === 'map', far = (x, y) => !inMap || dist2(x, y, pl.x, pl.y) > 520 * 520, still = [];
-    for (const i of zs.dead) { const d = map.defs[i]; if (far(d.x, d.y)) spawnMob(map, d, i); else still.push(i); }
-    zs.dead = still;
-    const stillOpen = [];
-    for (const c of map.chests) if (c.open) { if (far(c.x, c.y)) c.open = false; else stillOpen.push(c.idx); }
-    zs.ch = stillOpen;
-    UI.toast('The monsters have returned', '#ff9a7a');
+function endRun(won, abandoned) {
+  if (!R || R.over) return;
+  if (G) collectAll();
+  R.over = true; R.won = won;
+  const cleared = won ? CH_ROOMS : R.room - 1 + (G && G.cleared ? 1 : 0);
+  R.cleared = cleared;
+  if (cleared > (S.best[R.ch] || 0)) { S.best[R.ch] = cleared; R.newBest = true; }
+  if (won) {
+    R.bonus = Math.round((60 + 40 * R.ch) * R.ch * P.gold);
+    S.gold += R.bonus;
+    if (R.ch >= S.maxCh) { S.maxCh = R.ch + 1; R.unlocked = true; rollShop(); }
+    S.chSel = Math.min(S.maxCh, R.ch + 1);
   }
-  if (zs.boss && now - zs.boss >= BOSS_RESET) { zs.boss = 0; spawnBoss(); UI.toast(G.zi.boss + ' has returned to the arena', '#ff9a7a'); }
+  R.abandoned = !!abandoned;
+  input.x = input.y = 0;
+  save();
+  UI.onRunEnd();
+}
+function leaveRun() { R = null; G = null; computeStats(); save(); }
+
+/* ===== run level and the 1-of-3 ability choice ===== */
+function gainRunXp(x) {
+  R.xp += x;
+  while (R.xp >= runXpNext(R.lvl)) { R.xp -= runXpNext(R.lvl); R.lvl++; R.picks++; R.why = R.why === 'boss' ? 'boss' : 'level'; }
+}
+function abilityOk(id) {
+  const a = ABILITIES[id], n = R.abil[id] || 0;
+  if (n >= a.max) return false;
+  if (a.sup) return P.skills.some(s => s && supportFits(a, s.def));
+  return true;
+}
+function rollAbilities() {
+  const ids = Object.keys(ABILITIES).filter(abilityOk), out = [];
+  const weight = id => id === 'mend' ? (G.player.life < P.maxLife * 0.6 ? 2 : 0.4) : ABILITIES[id].sup ? 1.4 : 1;
+  while (out.length < 3 && ids.length) {
+    let tot = 0; for (const id of ids) tot += weight(id);
+    let r = Math.random() * tot, k = 0;
+    for (; k < ids.length - 1; k++) { r -= weight(ids[k]); if (r <= 0) break; }
+    out.push(ids.splice(k, 1)[0]);
+  }
+  return out;
+}
+function takeAbility(id) {
+  if (!R || !R.offer || !R.offer.includes(id)) return;
+  const a = ABILITIES[id];
+  R.abil[id] = (R.abil[id] || 0) + 1;
+  computeStats();
+  if (a.heal) heal(P.maxLife * a.heal);
+  R.picks = Math.max(0, R.picks - 1); R.offer = null; R.why = 'level';
+  save();
 }
 
-/* ===== map queries ===== */
-function walk(x, y) {
-  const tx = Math.floor(x / TILE), ty = Math.floor(y / TILE);
-  return tx >= 0 && ty >= 0 && tx < G.W && ty < G.H && G.grid[ty * G.W + tx] === 1;
-}
+/* ===== room queries ===== */
+const tileAt = (x, y) => { const tx = Math.floor(x / TILE), ty = Math.floor(y / TILE); return tx >= 0 && ty >= 0 && tx < G.W && ty < G.H ? G.grid[ty * G.W + tx] : 0; };
+const walk = (x, y) => tileAt(x, y) === 1;
+// shots fly over pits but stop at walls, rocks and the closed door
+const solid = (x, y) => { const t = tileAt(x, y); return t === 0 || t === 2 || t === 4; };
 function free(x, y, r) { r *= 0.75; return walk(x - r, y - r) && walk(x + r, y - r) && walk(x - r, y + r) && walk(x + r, y + r); }
 function moveEnt(e, dx, dy, r) {
   if (!free(e.x, e.y, r)) {   // squeezed against a wall: let it step out instead of freezing in place
     if (walk(e.x + dx, e.y + dy)) { e.x += dx; e.y += dy; }
-    return;
+    return false;
   }
-  if (dx && free(e.x + dx, e.y, r)) e.x += dx;
-  if (dy && free(e.x, e.y + dy, r)) e.y += dy;
+  let moved = false;
+  if (dx && free(e.x + dx, e.y, r)) { e.x += dx; moved = true; }
+  if (dy && free(e.x, e.y + dy, r)) { e.y += dy; moved = true; }
+  return moved;
 }
-function los(x0, y0, x1, y1) {
-  const n = Math.ceil(Math.hypot(x1 - x0, y1 - y0) / (TILE * 0.45));
-  for (let i = 1; i < n; i++) if (!walk(x0 + (x1 - x0) * i / n, y0 + (y1 - y0) * i / n)) return false;
+function los(x0, y0, x1, y1, walking) {
+  const n = Math.ceil(Math.hypot(x1 - x0, y1 - y0) / 5);
+  for (let i = 1; i < n; i++) {
+    const x = x0 + (x1 - x0) * i / n, y = y0 + (y1 - y0) * i / n;
+    if (walking ? !walk(x, y) : solid(x, y)) return false;
+  }
   return true;
 }
-// uncover the minimap around the player
-function explore() {
-  const pl = G.player, W = G.W, H = G.H, tx = Math.floor(pl.x / TILE), ty = Math.floor(pl.y / TILE), key = ty * W + tx;
-  if (key === G.lastTile) return;
-  G.lastTile = key; G.flowT = 0;
-  const R = 8;
-  for (let y = Math.max(0, ty - R); y <= Math.min(H - 1, ty + R); y++) for (let x = Math.max(0, tx - R); x <= Math.min(W - 1, tx + R); x++) {
-    if ((x - tx) * (x - tx) + (y - ty) * (y - ty) > R * R) continue;
-    const i = y * W + x;
-    if (!G.seen[i]) { G.seen[i] = 1; if (G.reveal.length < 20000) G.reveal.push(i); }
-  }
-  const lim = (R + 0.5) * TILE * (R + 0.5) * TILE;
-  for (const p of G.portals) if (!p.seen && dist2(p.x, p.y, pl.x, pl.y) < lim) {
-    p.seen = true;
-    UI.toast(p.kind === 'arena' ? 'You found the Arena portal' : 'You found the way to the next zone', '#9fe6ff');
-  }
-  for (const c of G.chests) if (!c.seen && dist2(c.x, c.y, pl.x, pl.y) < lim) c.seen = true;
-}
-// steps to the player from every nearby tile, so monsters can find their way around walls
+// steps to the player from every tile, so monsters find their way around rocks and pits
+const FLOW_Q = new Int32Array(ROOM_W * ROOM_H + 8);
 function updateFlow() {
   const W = G.W, H = G.H, f = G.flow, g = G.grid, pl = G.player;
   f.fill(32767);
   const s = Math.floor(pl.y / TILE) * W + Math.floor(pl.x / TILE);
-  if (s < 0 || s >= W * H || !g[s]) return;
+  if (s < 0 || s >= W * H || g[s] !== 1) return;
   let h = 0, t = 0; f[s] = 0; FLOW_Q[t++] = s;
   while (h < t) {
-    const c = FLOW_Q[h++], d = f[c] + 1; if (d > 32) continue;
-    const x = c % W;
-    if (x > 0 && g[c - 1] && f[c - 1] > d) { f[c - 1] = d; FLOW_Q[t++] = c - 1; }
-    if (x < W - 1 && g[c + 1] && f[c + 1] > d) { f[c + 1] = d; FLOW_Q[t++] = c + 1; }
-    if (c >= W && g[c - W] && f[c - W] > d) { f[c - W] = d; FLOW_Q[t++] = c - W; }
-    if (c < W * (H - 1) && g[c + W] && f[c + W] > d) { f[c + W] = d; FLOW_Q[t++] = c + W; }
+    const c = FLOW_Q[h++], d = f[c] + 1, x = c % W;
+    if (x > 0 && g[c - 1] === 1 && f[c - 1] > d) { f[c - 1] = d; FLOW_Q[t++] = c - 1; }
+    if (x < W - 1 && g[c + 1] === 1 && f[c + 1] > d) { f[c + 1] = d; FLOW_Q[t++] = c + 1; }
+    if (c >= W && g[c - W] === 1 && f[c - W] > d) { f[c - W] = d; FLOW_Q[t++] = c - W; }
+    if (c < W * (H - 1) && g[c + W] === 1 && f[c + W] > d) { f[c + W] = d; FLOW_Q[t++] = c + W; }
   }
 }
-function sees(m) {
-  if (m.losT <= G.t) { m.losT = G.t + 0.25; m.see = los(m.x, m.y, G.player.x, G.player.y); }
+function canWalkTo(m) {
+  if (m.losT <= G.t) { m.losT = G.t + 0.25; m.see = los(m.x, m.y, G.player.x, G.player.y, true); }
   return m.see;
 }
 function stepToward(m, tx, ty, sp) { const dx = tx - m.x, dy = ty - m.y, d = Math.hypot(dx, dy) || 1; moveEnt(m, dx / d * sp, dy / d * sp, m.r); }
 function chase(m, sp) {
   const pl = G.player;
-  if (sees(m)) { stepToward(m, pl.x, pl.y, sp); return; }
+  if (canWalkTo(m)) { stepToward(m, pl.x, pl.y, sp); return; }
   const W = G.W, H = G.H, f = G.flow, g = G.grid, tx = Math.floor(m.x / TILE), ty = Math.floor(m.y / TILE);
   if (tx < 0 || ty < 0 || tx >= W || ty >= H) return;
   let best = f[ty * W + tx], bx = -1, by = -1;
   for (let oy = -1; oy <= 1; oy++) for (let ox = -1; ox <= 1; ox++) {
     if (!ox && !oy) continue;
     const nx = tx + ox, ny = ty + oy;
-    if (nx < 0 || ny < 0 || nx >= W || ny >= H || !g[ny * W + nx]) continue;
-    if (ox && oy && (!g[ty * W + nx] || !g[ny * W + tx])) continue;   // no cutting corners
+    if (nx < 0 || ny < 0 || nx >= W || ny >= H || g[ny * W + nx] !== 1) continue;
+    if (ox && oy && (g[ty * W + nx] !== 1 || g[ny * W + tx] !== 1)) continue;   // no cutting corners
     if (f[ny * W + nx] < best) { best = f[ny * W + nx]; bx = nx; by = ny; }
   }
   if (bx >= 0) stepToward(m, (bx + 0.5) * TILE, (by + 0.5) * TILE, sp);
 }
-function wake(m) {
-  if (m.awake) return;
-  m.awake = true;
-  if (m.pack !== undefined) for (const o of G.mobs) if (o.pack === m.pack) o.awake = true;
-}
 
 /* ===== combat ===== */
 function addText(x, y, txt, color, big) { if (G.texts.length < 60) G.texts.push({ x: x + rnd(-6, 6), y, txt, color, big, t: 0 }); }
-function addFx(o) { if (G.fx.length < 120) { o.t = 0; G.fx.push(o); } }
-function heal(v) { const pl = G.player; pl.life = Math.min(P.maxLife, pl.life + v); }
-// nearest monster that can be seen from (x, y)
+function addFx(o) { if (G.fx.length < 140) { o.t = 0; G.fx.push(o); } }
+function heal(v) { const pl = G && G.player; if (pl) pl.life = Math.min(P.maxLife, pl.life + v); }
+// a shot of some width gets through: checks the centre line and both edges
+function losWide(x0, y0, x1, y1, w) {
+  const d = Math.hypot(x1 - x0, y1 - y0) || 1, nx = -(y1 - y0) / d * w, ny = (x1 - x0) / d * w;
+  return los(x0, y0, x1, y1) && los(x0 + nx, y0 + ny, x1 + nx, y1 + ny) && los(x0 - nx, y0 - ny, x1 - nx, y1 - ny);
+}
 function nearestMob(x, y, range, exclude) {
   let best = null, bd = range * range;
   for (const m of G.mobs) {
     if (m.dead || (exclude && exclude.includes(m))) continue;
     const d = dist2(x, y, m.x, m.y) - m.r * m.r;
-    if (d < bd && los(x, y, m.x, m.y)) { bd = d; best = m; }
+    if (d < bd && losWide(x, y, m.x, m.y, 5)) { bd = d; best = m; }
   }
   return best;
 }
@@ -356,7 +363,6 @@ function hitMob(m, info, mult) {
 }
 function damageMob(m, amt, crit, quiet) {
   if (m.dead) return;
-  wake(m);
   m.hp -= amt; m.flash = 0.1;
   if (!quiet) addText(m.x, m.y - m.r, String(Math.max(1, Math.round(amt))), crit ? '#ffd84a' : '#ffffff', crit);
   if (m.hp <= 0) killMob(m);
@@ -367,15 +373,15 @@ function gainXp(x) {
     while (S.level < LEVEL_CAP && S.xp >= xpNext(S.level)) {
       S.xp -= xpNext(S.level); S.level++;
       statsDirty = true;
-      computeStats(); G.player.life = P.maxLife;
+      computeStats();
       addFx({ k: 'ring', x: G.player.x, y: G.player.y, r: 120, d: 0.7, color: '#ffe9a0', follow: true });
       UI.onLevel();
     }
   }
-  for (const s of S.slots) for (const id of [s.skill, s.sup[0], s.sup[1], s.sup[2]]) {
-    const g = gemById(id); if (!g || g.lvl >= GEM_MAX) continue;
+  for (const s of S.slots) {
+    const g = gemById(s.skill); if (!g || g.lvl >= GEM_MAX) continue;
     g.xp += x;
-    while (g.lvl < GEM_MAX && g.xp >= gemXpNext(g.lvl)) { g.xp -= gemXpNext(g.lvl); g.lvl++; statsDirty = true; UI.toast(gemDef(g).name + ' reached level ' + g.lvl, '#58d8c8'); }
+    while (g.lvl < GEM_MAX && g.xp >= gemXpNext(g.lvl)) { g.xp -= gemXpNext(g.lvl); g.lvl++; statsDirty = true; UI.toast(SKILLS[g.id].name + ' reached level ' + g.lvl, '#58d8c8'); }
   }
 }
 function dropAt(x, y, o, spread) {
@@ -385,191 +391,237 @@ function dropAt(x, y, o, spread) {
   o.t = 0; G.drops.push(o);
 }
 function killMob(m) {
-  m.dead = true; S.stats.kills++;
-  if (m.idx !== undefined && G.area === 'map') G.zs.dead.push(m.idx);
+  m.dead = true; S.stats.kills++; R.kills++;
   const L = G.zi.level, diff = S.level - L, find = zoneFind(L), qty = zoneQuantity(L);
   gainXp(m.xp * (diff > 4 ? Math.max(0.1, 1 - (diff - 4) * 0.15) : 1));
+  gainRunXp(m.boss ? (m.final ? 10 : 6) : [1, 2, 4][m.rar]);
   if (P.lifeOnKill) heal(P.lifeOnKill);
   addFx({ k: 'burst', x: m.x, y: m.y, r: m.r * 2.2, d: 0.35, color: m.color });
   const ri = m.boss ? 3 : m.rar;
-  if (Math.random() < [0.35, 0.75, 1, 1][ri]) dropAt(m.x, m.y, { gold: Math.max(1, Math.round((3 + L * 1.6) * rnd(0.6, 1.4) * [1, 2, 4, 14][ri] * P.gold)) });
-  const n = m.boss ? 5 : (Math.random() < [0.13, 0.45, 1][m.rar] * qty ? 1 : 0) + (m.rar === 2 && Math.random() < 0.5 * qty ? 1 : 0);
-  for (let i = 0; i < n; i++) dropAt(m.x, m.y, { item: makeItem(L + (m.boss ? 1 : 0), { rarityMult: P.rarity * find * [1, 1.5, 2.5, 4][ri], rarity: m.boss && i === 0 ? 2 : undefined }) }, m.boss ? 34 : 14);
-  if (Math.random() < [0.006, 0.025, 0.09, 1][ri]) dropAt(m.x, m.y, { gem: randomGem() });
-  if (Math.random() < [0.0004, 0.0015, 0.006, 0.03][ri]) dropAt(m.x, m.y, { sigil: 1 });
+  if (Math.random() < [0.4, 0.8, 1, 1][ri]) dropAt(m.x, m.y, { gold: Math.max(1, Math.round((3 + L * 1.6) * rnd(0.6, 1.4) * [1, 2, 4, 12][ri] * P.gold)) });
+  const n = m.boss ? (m.final ? 4 : 2) : (Math.random() < [0.06, 0.25, 0.8][m.rar] * qty ? 1 : 0);
+  for (let i = 0; i < n; i++) dropAt(m.x, m.y, { item: makeItem(L + (m.boss ? 1 : 0), { rarityMult: P.rarity * find * [1, 1.5, 2.5, 4][ri], rarity: m.boss && i === 0 ? (m.final ? 2 : 1) : undefined }) }, m.boss ? 34 : 14);
+  if (Math.random() < [0.004, 0.015, 0.06, m.final ? 0.6 : 0.2][ri]) dropAt(m.x, m.y, { gem: randomGem() });
   if (m.boss) {
-    G.zs.boss = Date.now();
     S.stats.bosses = (S.stats.bosses || 0) + 1;
     for (const o of G.mobs) if (!o.dead && o !== m) { o.dead = true; addFx({ k: 'burst', x: o.x, y: o.y, r: o.r * 2, d: 0.3, color: o.color }); }
     G.eprojs.length = 0;
-    UI.toast(m.name + ' is defeated — returns in 20 minutes', '#9fe6ff');
-    save();
+    R.picks++; R.why = 'boss';
+    heal(P.maxLife * 0.3);
   }
 }
-function openChest(c) {
-  c.open = true;
-  if (G.area === 'map') G.zs.ch.push(c.idx);
-  const L = G.zi.level, T = CHESTS[c.tier], find = zoneFind(L);
-  const n = rndi(T.items[0], T.items[1]) + (Math.random() < zoneQuantity(L) - 1 ? 1 : 0);
-  for (let i = 0; i < n; i++) dropAt(c.x, c.y, { item: makeItem(L, { rarityMult: P.rarity * find * T.rar, rarity: c.tier === 'ornate' && i === 0 ? 2 : undefined }) }, 34);
-  for (let i = 0; i < 3; i++) dropAt(c.x, c.y, { gold: Math.max(1, Math.round((3 + L * 1.6) * T.gold / 3 * rnd(0.7, 1.3) * P.gold)) }, 30);
-  if (Math.random() < T.gem) dropAt(c.x, c.y, { gem: randomGem() }, 30);
-  if (Math.random() < T.sigil) dropAt(c.x, c.y, { sigil: 1 }, 30);
-  addFx({ k: 'ring', x: c.x, y: c.y, r: 44, d: 0.35, color: '#ffd84a' });
+function pickUp(d, quiet) {
+  const pl = G.player;
+  if (d.gold) { S.gold += d.gold; if (!quiet) addText(pl.x, pl.y - 26, '+' + d.gold, '#ffd84a'); return true; }
+  if (d.gem) { S.gems.push(d.gem); R.gems++; UI.toast('Gem found: ' + SKILLS[d.gem.id].name, '#58d8c8'); UI.onLoot('gem'); return true; }
+  if (d.item.rarity < S.opts.autoSell) { const v = itemValue(d.item); S.gold += v; if (!quiet) addText(pl.x, pl.y - 26, '+' + v, '#ffd84a'); return true; }
+  if (S.inv.length < INV_SIZE) {
+    S.inv.push(d.item); R.items++;
+    if (d.item.rarity >= 2) UI.toast(d.item.name, RARITY_COLOR[d.item.rarity]);
+    UI.onLoot(); return true;
+  }
+  if (quiet) { S.gold += itemValue(d.item); return true; }   // bag full on the way out: sold instead of lost
+  return false;
 }
 function damagePlayer(amt, type) {
   const pl = G.player;
-  if (G.dead || pl.blink > 0) return;
+  if (G.dead || pl.blink > 0 || pl.hurt > 0) return;
   if (Math.random() * 100 < P.dodge) { addText(pl.x, pl.y - 18, 'Dodge', '#9fe6a0'); return; }
   if (type === 'phys') amt *= 1 - Math.min(0.8, P.armour / (P.armour + 8 * amt));
   else amt *= 1 - (P.res[type] || 0) / 100;
-  pl.life -= amt; pl.flash = 0.15; G.shake = Math.min(8, G.shake + 3 + amt / P.maxLife * 20);
+  pl.life -= amt; pl.flash = 0.15; pl.hurt = 0.18; G.shake = Math.min(8, G.shake + 3 + amt / P.maxLife * 20);
   addText(pl.x, pl.y - 18, String(Math.max(1, Math.round(amt))), '#ff6a5c');
-  if (pl.life <= 0) { pl.life = 0; G.dead = true; S.stats.deaths++; input.x = input.y = 0; UI.onDeath(); }
-}
-// back to the zone entrance; slain monsters stay dead, everything else calms down
-function resurrect() {
-  resetArena();
-  const map = G.areas.map;
-  for (const m of map.mobs) if (m.awake) { m.awake = false; m.x = m.sx; m.y = m.sy; m.hp = m.maxHp; m.burn = 0; m.burnT = 0; }
-  map.eprojs.length = 0; map.projs.length = 0; map.delayed.length = 0;
-  G.dead = false; G.cds = [0, 0, 0, 0];
-  G.player.life = P.maxLife; G.player.flash = 0;
-  enterArea('map', map.start.x, map.start.y);
+  if (pl.life <= 0) { pl.life = 0; G.dead = true; S.stats.deaths++; input.x = input.y = 0; endRun(false); }
 }
 
-/* ===== portals and other things the player can use ===== */
-function actions() {
-  const out = [];
-  if (!G || G.dead) return out;
-  const n = G.near;
-  if (n && n.kind === 'arena') out.push({ id: 'arena', label: 'Enter Arena' });
-  if (n && n.kind === 'leave') out.push({ id: 'leave', label: 'Leave Arena' });
-  if (n && n.kind === 'exit') out.push({ id: 'exit', label: 'Travel to ' + zoneInfo(S.zone + 1).name });
-  if (S.sigils > 0 && G.zs.boss && (G.area === 'arena' || (n && n.kind === 'arena'))) out.push({ id: 'sigil', label: 'Use ' + SIGIL_NAME + ' (' + S.sigils + ')' });
-  return out;
-}
-function doAction(id) {
-  if (!actions().some(a => a.id === id)) return;
-  const map = G.areas.map, arena = G.areas.arena;
-  if (id === 'arena') { resetArena(); enterArea('arena', arena.start.x, arena.start.y); }
-  else if (id === 'leave') { resetArena(); const p = map.portals[0]; enterArea('map', p.x, p.y); }
-  else if (id === 'exit') {
-    const next = S.zone + 1;
-    if (next > S.maxZone) { S.maxZone = next; rollShop(); }
-    startZone(next); save();
-  } else if (id === 'sigil') {
-    S.sigils--; G.zs.boss = 0; spawnBoss();
-    UI.toast(G.zi.boss + ' answers the sigil', '#ff5ad0');
-    if (G.area === 'arena') addFx({ k: 'ring', x: arena.bossAt.x, y: arena.bossAt.y, r: 90, d: 0.6, color: '#ff5ad0', fill: true });
-    save();
-  }
-}
-
-/* ===== skills ===== */
-function castSkill(info, isEcho) {
+/* ===== player skills ===== */
+function castSkill(info) {
   const pl = G.player, d = info.def, sa = Math.sqrt(info.area);
   switch (d.kind) {
     case 'arc': {
-      const R = d.range * sa, t = nearestMob(pl.x, pl.y, R); if (!t) return false;
-      const ang = Math.atan2(t.y - pl.y, t.x - pl.x); pl.face = ang;
-      for (const m of mobsInRange(pl.x, pl.y, R)) {
+      // a full-strength sweep up close, and a weaker wave that carries the cut further
+      const R0 = d.range * sa, t = nearestMob(pl.x, pl.y, 260 * sa); if (!t) return false;
+      const ang = Math.atan2(t.y - pl.y, t.x - pl.x), hit = []; pl.face = ang;
+      for (const m of mobsInRange(pl.x, pl.y, R0)) {
         let da = Math.abs(Math.atan2(m.y - pl.y, m.x - pl.x) - ang); if (da > Math.PI) da = Math.PI * 2 - da;
-        if (da < 1.25 || dist2(pl.x, pl.y, m.x, m.y) < (m.r + 16) * (m.r + 16)) hitMob(m, info);
+        if (da < 1.25 || dist2(pl.x, pl.y, m.x, m.y) < (m.r + 16) * (m.r + 16)) { hitMob(m, info); hit.push(m); }
       }
-      addFx({ k: 'arc', x: pl.x, y: pl.y, r: R, a: ang, d: 0.18, color: d.color, follow: true });
+      addFx({ k: 'arc', x: pl.x, y: pl.y, r: R0, a: ang, d: 0.18, color: d.color, follow: true });
+      const wi = Object.assign({}, info, { dmg: { phys: info.dmg.phys * 0.6, fire: info.dmg.fire * 0.6, cold: info.dmg.cold * 0.6, light: info.dmg.light * 0.6 } });
+      G.projs.push({ x: pl.x, y: pl.y, vx: Math.cos(ang) * 380, vy: Math.sin(ang) * 380, r: 14, life: 0.7 * sa, info: wi, pierce: 99, chain: 0, hit, color: d.color, kind: 'wave' });
       return true;
     }
     case 'bolt': case 'lance': {
-      const t = nearestMob(pl.x, pl.y, d.range); if (!t) return false;
+      const t = nearestMob(pl.x, pl.y, 900); if (!t) return false;
       const ang = Math.atan2(t.y - pl.y, t.x - pl.x); pl.face = ang;
-      const n = 1 + info.proj, spd = d.kind === 'lance' ? 420 : 300;
+      const n = 1 + info.proj, spd = d.kind === 'lance' ? 440 : 340;
       for (let i = 0; i < n; i++) {
         const a = ang + (i - (n - 1) / 2) * 0.2;
-        G.projs.push({ x: pl.x, y: pl.y, vx: Math.cos(a) * spd, vy: Math.sin(a) * spd, r: d.kind === 'lance' ? 5 : 6, life: 1.3, info, pierce: info.pierce, chain: info.chain, hit: [], color: d.color, kind: d.kind });
+        G.projs.push({ x: pl.x, y: pl.y, vx: Math.cos(a) * spd, vy: Math.sin(a) * spd, r: d.kind === 'lance' ? 5 : 6, life: 2.2, info, pierce: info.pierce, chain: info.chain, hit: [], color: d.color, kind: d.kind });
       }
       return true;
     }
     case 'nova': {
-      const R = d.range * sa; if (!nearestMob(pl.x, pl.y, R)) return false;
-      for (const m of mobsInRange(pl.x, pl.y, R)) hitMob(m, info);
-      addFx({ k: 'ring', x: pl.x, y: pl.y, r: R, d: 0.3, color: d.color, fill: true });
+      const R0 = d.range * sa; if (!nearestMob(pl.x, pl.y, R0)) return false;
+      for (const m of mobsInRange(pl.x, pl.y, R0)) hitMob(m, info);
+      addFx({ k: 'ring', x: pl.x, y: pl.y, r: R0, d: 0.3, color: d.color, fill: true });
       return true;
     }
     case 'chain': {
-      let t = nearestMob(pl.x, pl.y, d.range); if (!t) return false;
+      let t = nearestMob(pl.x, pl.y, d.range * 1.5); if (!t) return false;
       pl.face = Math.atan2(t.y - pl.y, t.x - pl.x);
       const hit = [], pts = [{ x: pl.x, y: pl.y }];
-      for (let i = 0; i <= info.chain && t; i++) { hit.push(t); pts.push({ x: t.x, y: t.y }); hitMob(t, info); t = nearestMob(t.x, t.y, 150, hit); }
+      for (let i = 0; i <= info.chain && t; i++) { hit.push(t); pts.push({ x: t.x, y: t.y }); hitMob(t, info); t = nearestMob(t.x, t.y, 160, hit); }
       addFx({ k: 'bolt', pts, d: 0.16, color: d.color });
       return true;
     }
     case 'blink': {
-      const c = mobsInRange(pl.x, pl.y, d.range).filter(m => los(pl.x, pl.y, m.x, m.y)); if (!c.length) return false;
+      const c = mobsInRange(pl.x, pl.y, d.range).filter(m => los(pl.x, pl.y, m.x, m.y, true)); if (!c.length) return false;
       const t = pick(c), ang = Math.atan2(t.y - pl.y, t.x - pl.x), ox = pl.x, oy = pl.y;
       let nx = t.x - Math.cos(ang) * (t.r + PLAYER_R + 2), ny = t.y - Math.sin(ang) * (t.r + PLAYER_R + 2);
-      if (!free(nx, ny, PLAYER_R)) { nx = t.x; ny = t.y; }
       if (!free(nx, ny, PLAYER_R)) { nx = ox; ny = oy; }
-      pl.x = nx; pl.y = ny; pl.face = ang; pl.blink = 0.12;
-      const R = 46 * sa;
-      for (const m of mobsInRange(pl.x, pl.y, R)) hitMob(m, info, m === t ? 1 : 0.6);
+      pl.x = nx; pl.y = ny; pl.face = ang; pl.blink = 0.15;
+      const R0 = 46 * sa;
+      for (const m of mobsInRange(pl.x, pl.y, R0)) hitMob(m, info, m === t ? 1 : 0.6);
       addFx({ k: 'trail', x: ox, y: oy, x2: pl.x, y2: pl.y, d: 0.22, color: d.color });
-      addFx({ k: 'ring', x: pl.x, y: pl.y, r: R, d: 0.2, color: d.color, fill: true });
+      addFx({ k: 'ring', x: pl.x, y: pl.y, r: R0, d: 0.2, color: d.color, fill: true });
       return true;
     }
     case 'meteor': {
-      const c = mobsInRange(pl.x, pl.y, d.range).filter(m => los(pl.x, pl.y, m.x, m.y)); if (!c.length) return false;
-      const t = pick(c), x = t.x, y = t.y, R = 72 * sa, area = G.area;
-      addFx({ k: 'warn', x, y, r: R, d: 0.7, color: d.color });
-      G.delayed.push({ t: 0.7, fn() { if (G.area !== area) return; for (const m of mobsInRange(x, y, R)) hitMob(m, info); addFx({ k: 'ring', x, y, r: R * 1.15, d: 0.35, color: '#ffb060', fill: true }); G.shake = Math.min(8, G.shake + 2.5); } });
+      const c = mobsInRange(pl.x, pl.y, d.range * 1.4).filter(m => los(pl.x, pl.y, m.x, m.y)); if (!c.length) return false;
+      const t = pick(c), x = t.x, y = t.y, R0 = 72 * sa, room = G;
+      addFx({ k: 'warn', x, y, r: R0, d: 0.7, color: d.color });
+      G.delayed.push({ t: 0.7, fn() { if (G !== room) return; for (const m of mobsInRange(x, y, R0)) hitMob(m, info); addFx({ k: 'ring', x, y, r: R0 * 1.15, d: 0.35, color: '#ffb060', fill: true }); G.shake = Math.min(8, G.shake + 2.5); } });
       return true;
     }
   }
   return false;
 }
 function orbitBlades(info) {
-  const n = info.def.blades + info.proj, R = info.def.range * Math.sqrt(info.area), out = [];
-  for (let k = 0; k < n; k++) { const a = G.t * 3.4 + k * Math.PI * 2 / n; out.push({ x: G.player.x + Math.cos(a) * R, y: G.player.y + Math.sin(a) * R, a }); }
+  const n = info.def.blades + info.proj, R0 = info.def.range * Math.sqrt(info.area), out = [];
+  for (let k = 0; k < n; k++) { const a = G.t * 3.4 + k * Math.PI * 2 / n; out.push({ x: G.player.x + Math.cos(a) * R0, y: G.player.y + Math.sin(a) * R0, a }); }
   return out;
 }
 function updateOrbit(info) {
   const bl = orbitBlades(info), pl = G.player, reach = info.def.range * Math.sqrt(info.area) + 50;
   for (const m of G.mobs) {
     if (m.dead || G.t < m.orbT || dist2(pl.x, pl.y, m.x, m.y) > reach * reach) continue;
-    // the blades sweep the whole circle, so anything inside it is cut once per rotation step
     const inside = dist2(pl.x, pl.y, m.x, m.y) < (reach - 42 + m.r) * (reach - 42 + m.r);
     if (inside || bl.some(b => dist2(b.x, b.y, m.x, m.y) < (m.r + 13) * (m.r + 13))) { hitMob(m, info); m.orbT = G.t + info.cd; }
   }
 }
 
-/* ===== main update ===== */
+/* ===== monsters ===== */
 const EL_COLOR = { fire: '#ff7a3c', cold: '#8fd8ff', light: '#f7f08a', phys: '#c9b8a0' };
+function shoot(m, ang, spd, dmg, r) {
+  const el = G.zi.el;
+  G.eprojs.push({ x: m.x + Math.cos(ang) * m.r * 0.8, y: m.y + Math.sin(ang) * m.r * 0.8, vx: Math.cos(ang) * spd, vy: Math.sin(ang) * spd, r: r || 6, life: 5, dmg, el, color: EL_COLOR[el] });
+}
+function fan(m, n, spread, spd, dmg) { const a = Math.atan2(G.player.y - m.y, G.player.x - m.x); for (let i = 0; i < n; i++) shoot(m, a + (i - (n - 1) / 2) * spread, spd, dmg); }
+function ring(m, n, off, spd, dmg) { for (let i = 0; i < n; i++) shoot(m, off + i * Math.PI * 2 / n, spd, dmg); }
+function dashStep(m, dt, speed) {
+  const moved = moveEnt(m, Math.cos(m.ang) * speed * dt, Math.sin(m.ang) * speed * dt, m.r);
+  const pl = G.player;
+  if (!m.dashHit && dist2(m.x, m.y, pl.x, pl.y) < (m.r + PLAYER_R) * (m.r + PLAYER_R)) { m.dashHit = true; damagePlayer(m.dmg * 1.3, 'phys'); }
+  return moved;
+}
+function updateMob(m, dt) {
+  const pl = G.player, dx = pl.x - m.x, dy = pl.y - m.y, d = Math.hypot(dx, dy) || 1, ux = dx / d, uy = dy / d;
+  const slow = m.chill > 0 ? 0.65 : 1, sp = m.spd * slow * dt;
+  m.atkT -= dt * slow; m.wob += dt * 6;
+  const contact = () => { if (d < m.r + PLAYER_R + 4 && m.atkT <= 0) { m.atkT = 1.1; m.lunge = 0.18; damagePlayer(m.dmg, 'phys'); } };
+  if (m.boss) { updateBoss(m, dt, d, sp); return; }
+  if (m.totem) {
+    if (m.atkT <= 0 && los(m.x, m.y, pl.x, pl.y)) {
+      m.atkT = 2.8; m.n = (m.n || 0) + 1;
+      if (m.n % 2) ring(m, 8, m.wob, 120, m.dmg * 0.8); else fan(m, 3, 0.28, 150, m.dmg);
+    }
+    return;
+  }
+  if (m.charge) {
+    m.stT -= dt * slow;
+    if (m.st === 'walk') {
+      chase(m, sp); contact();
+      if (m.stT <= 0 && d < 360 && los(m.x, m.y, pl.x, pl.y, true)) { m.st = 'aim'; m.stT = 0.65; m.ang = Math.atan2(dy, dx); addFx({ k: 'line', x: m.x, y: m.y, a: m.ang, len: 300, w: m.r * 2, d: 0.65, color: '#ff5a3a' }); }
+    } else if (m.st === 'aim') { if (m.stT <= 0) { m.st = 'dash'; m.stT = 0.6; m.dashHit = false; } }
+    else if (m.st === 'dash') { if (!dashStep(m, dt, 360) || m.stT <= 0) { m.st = 'rest'; m.stT = 0.6; } }
+    else if (m.st === 'rest' && m.stT <= 0) { m.st = 'walk'; m.stT = rnd(2.2, 3.4); }
+    return;
+  }
+  if (m.ranged) {
+    const sees = los(m.x, m.y, pl.x, pl.y);
+    if (!sees || d > 250) chase(m, sp);
+    else if (d < 150) moveEnt(m, -ux * sp * 0.8, -uy * sp * 0.8, m.r);
+    else moveEnt(m, -uy * sp * 0.5 * Math.sin(m.wob * 0.2), ux * sp * 0.5 * Math.sin(m.wob * 0.2), m.r);
+    if (m.atkT <= 0 && sees && d < 420) { m.atkT = 2.2; shoot(m, Math.atan2(dy, dx), 165, m.dmg); m.lunge = 0.15; }
+    return;
+  }
+  if (d > m.r + PLAYER_R + 2) chase(m, sp);
+  contact();
+}
+// bosses cycle through their attack patterns
+function updateBoss(m, dt, d, sp) {
+  const pl = G.player, fin = m.final, bd = m.dmg * 0.5;
+  m.stT -= dt;
+  if (m.st === 'idle') {
+    if (d > m.r + PLAYER_R + 6) chase(m, sp * 0.8);
+    if (d < m.r + PLAYER_R + 6 && m.atkT <= 0) { m.atkT = 1.2; m.lunge = 0.2; damagePlayer(m.dmg, 'phys'); }
+    if (m.stT <= 0) {
+      m.st = m.pats[m.pi % m.pats.length]; m.pi++; m.n = 0; m.emitT = 0;
+      if (m.st === 'ring') m.stT = fin ? 0.8 : 0.4;
+      if (m.st === 'fan') m.stT = fin ? 1.0 : 0.7;
+      if (m.st === 'spiral') { m.stT = 2.2; m.ang = rnd(0, 6.28); }
+      if (m.st === 'dash') { m.stT = fin ? 0.65 : 0.8; m.ang = Math.atan2(pl.y - m.y, pl.x - m.x); addFx({ k: 'line', x: m.x, y: m.y, a: m.ang, len: 520, w: m.r * 2, d: m.stT, color: '#ff3a2a' }); }
+      if (m.st === 'summon') m.stT = 0.3;
+    }
+    return;
+  }
+  m.emitT -= dt;
+  if (m.st === 'ring') {
+    if (m.emitT <= 0 && m.n < (fin ? 2 : 1)) { m.emitT = 0.35; ring(m, fin ? 18 : 14, m.n * 0.17 + m.wob, 125, bd); m.n++; addFx({ k: 'ring', x: m.x, y: m.y, r: 60, d: 0.3, color: EL_COLOR[G.zi.el] }); }
+  } else if (m.st === 'fan') {
+    if (m.emitT <= 0 && m.n < (fin ? 3 : 2)) { m.emitT = 0.32; fan(m, 5, 0.22, 165, bd); m.n++; }
+  } else if (m.st === 'spiral') {
+    if (m.emitT <= 0) { m.emitT = fin ? 0.07 : 0.09; m.ang += 0.32; shoot(m, m.ang, 130, bd * 0.8); shoot(m, m.ang + Math.PI, 130, bd * 0.8); }
+  } else if (m.st === 'dash') {
+    if (m.n === 0 && m.stT <= 0) { m.n = 1; m.stT = 0.7; m.dashHit = false; }
+    else if (m.n === 1) { if (!dashStep(m, dt, fin ? 470 : 430) && m.stT < 0.6) m.stT = 0; }
+  } else if (m.st === 'summon') {
+    if (m.n === 0) { m.n = 1; const alive = G.mobs.filter(o => !o.boss && !o.dead).length; for (let k = 0; k < Math.min(3, 8 - alive); k++) spawnMob({ type: 'swarm', x: m.x + rnd(-40, 40), y: m.y + rnd(-40, 40) }); addFx({ k: 'ring', x: m.x, y: m.y, r: 70, d: 0.4, color: '#9fe66a', fill: true }); }
+  }
+  if (m.stT <= 0 && !(m.st === 'dash' && m.n === 0)) { m.st = 'idle'; m.stT = fin ? 1.1 : 1.5; }
+}
+
+/* ===== main update ===== */
 function update(dt) {
-  if (!G || G.dead) return;
+  if (!G || G.dead || !R || R.over) return;
   const pl = G.player;
   G.t += dt;
   let ix = input.x, iy = input.y; const il = Math.hypot(ix, iy);
   if (il > 1) { ix /= il; iy /= il; }
+  const moving = il > 0.1;
   moveEnt(pl, ix * P.speed * dt, iy * P.speed * dt, PLAYER_R);
-  if (il > 0.1) { pl.walk += dt * Math.min(1, il); if (G.t - pl.castT > 0.45) pl.face = Math.atan2(iy, ix); }
+  if (moving) { pl.walk += dt * Math.min(1, il); if (G.t - pl.castT > 0.3) pl.face = Math.atan2(iy, ix); }
   pl.life = Math.min(P.maxLife, pl.life + P.regen * dt);
   if (pl.flash > 0) pl.flash -= dt;
   if (pl.blink > 0) pl.blink -= dt;
+  if (pl.hurt > 0) pl.hurt -= dt;
   if (G.shake > 0) G.shake = Math.max(0, G.shake - dt * 22);
-  explore();
   G.flowT -= dt;
-  if (G.flowT <= 0) { G.flowT = 0.3; updateFlow(); }
-  G.tickT -= dt;
-  if (G.tickT <= 0) { G.tickT = 0.5; zoneTick(); }
+  if (G.flowT <= 0) { G.flowT = 0.25; updateFlow(); }
+  const awake = G.t > 0.8;   // monsters fade in at the start of a room before they act
 
-  // skills fire on their own as soon as they are ready and have a target in sight
+  // skills reload all the time but only fire while the player stands still; orbiting blades never stop
   for (let i = 0; i < 4; i++) {
     const info = P.skills[i]; if (!info) continue;
-    if (info.def.kind === 'orbit') { updateOrbit(info); continue; }
-    G.cds[i] -= dt;
-    if (G.cds[i] <= 0) {
-      if (castSkill(info, false)) { G.cds[i] = info.cd; pl.castT = G.t; if (info.echo) { const area = G.area; G.delayed.push({ t: 0.22, fn() { if (G.area === area) castSkill(info, true); } }); } }
-      else G.cds[i] = 0.08;
+    if (info.def.kind === 'orbit') { if (awake) updateOrbit(info); continue; }
+    if (G.cds[i] > 0) G.cds[i] -= dt;
+    if (G.cds[i] <= 0 && !moving && awake) {
+      if (castSkill(info)) {
+        G.cds[i] = info.cd; pl.castT = G.t;
+        const room = G;
+        for (let e = 1; e <= info.echo; e++) G.delayed.push({ t: 0.2 * e, fn() { if (G === room) castSkill(info); } });
+      } else G.cds[i] = 0.06;
     }
   }
   for (let i = G.delayed.length - 1; i >= 0; i--) { const d = G.delayed[i]; d.t -= dt; if (d.t <= 0) { G.delayed.splice(i, 1); d.fn(); } }
@@ -578,14 +630,14 @@ function update(dt) {
   for (let i = G.projs.length - 1; i >= 0; i--) {
     const p = G.projs[i]; p.x += p.vx * dt; p.y += p.vy * dt; p.life -= dt;
     let gone = p.life <= 0;
-    if (!gone && !walk(p.x, p.y)) { gone = true; addFx({ k: 'burst', x: p.x, y: p.y, r: 10, d: 0.15, color: p.color }); }
+    if (!gone && solid(p.x, p.y)) { gone = true; addFx({ k: 'burst', x: p.x, y: p.y, r: 10, d: 0.15, color: p.color }); }
     if (!gone) for (const m of G.mobs) {
       if (m.dead || p.hit.includes(m) || dist2(p.x, p.y, m.x, m.y) > (m.r + p.r) * (m.r + p.r)) continue;
       p.hit.push(m); hitMob(m, p.info);
       addFx({ k: 'burst', x: p.x, y: p.y, r: 12, d: 0.15, color: p.color });
       if (p.chain > 0) {
-        const t = nearestMob(p.x, p.y, 190, p.hit);
-        if (t) { const sp = Math.hypot(p.vx, p.vy), a = Math.atan2(t.y - p.y, t.x - p.x); p.vx = Math.cos(a) * sp; p.vy = Math.sin(a) * sp; p.chain--; p.life = Math.max(p.life, 0.7); break; }
+        const t = nearestMob(p.x, p.y, 200, p.hit);
+        if (t) { const sp = Math.hypot(p.vx, p.vy), a = Math.atan2(t.y - p.y, t.x - p.x); p.vx = Math.cos(a) * sp; p.vy = Math.sin(a) * sp; p.chain--; p.life = Math.max(p.life, 0.8); break; }
       }
       if (p.pierce > 0) { p.pierce--; continue; }
       gone = true; break;
@@ -595,96 +647,57 @@ function update(dt) {
   // enemy projectiles
   for (let i = G.eprojs.length - 1; i >= 0; i--) {
     const p = G.eprojs[i]; p.x += p.vx * dt; p.y += p.vy * dt; p.life -= dt;
-    if (p.life <= 0 || !walk(p.x, p.y)) { G.eprojs.splice(i, 1); continue; }
-    if (dist2(p.x, p.y, pl.x, pl.y) < (PLAYER_R + p.r) * (PLAYER_R + p.r)) { damagePlayer(p.dmg, p.el); G.eprojs.splice(i, 1); if (G.dead) return; }
+    if (p.life <= 0 || solid(p.x, p.y)) { G.eprojs.splice(i, 1); continue; }
+    if (dist2(p.x, p.y, pl.x, pl.y) < (PLAYER_R + p.r - 2) * (PLAYER_R + p.r - 2)) { damagePlayer(p.dmg, p.el); G.eprojs.splice(i, 1); if (G.dead) return; }
   }
 
-  // monsters: asleep until the player comes into view
-  const awake = [];
+  // monsters
   for (const m of G.mobs) {
     if (m.dead) continue;
     if (m.flash > 0) m.flash -= dt;
     if (m.burnT > 0) { m.burnT -= dt; damageMob(m, m.burn * dt, false, true); if (m.dead) continue; if (m.burnT <= 0) m.burn = 0; }
-    const dx = pl.x - m.x, dy = pl.y - m.y, d = Math.hypot(dx, dy) || 1;
-    if (!m.awake) {
-      const sight = m.boss ? 330 : m.ranged ? 300 : 250;
-      if (d < sight && los(m.x, m.y, pl.x, pl.y)) wake(m); else continue;
-    }
-    awake.push(m);
+    if (!awake) continue;
     if (m.lunge > 0) m.lunge -= dt;
     if (m.chill > 0) m.chill -= dt;
-    const slow = m.chill > 0 ? 0.65 : 1, ux = dx / d, uy = dy / d, sp = m.spd * slow * dt;
-    m.atkT -= dt * slow; m.wob += dt * 6;
-    if (m.ranged) {
-      if (!sees(m) || d > 210) chase(m, sp);
-      else if (d < 130) moveEnt(m, -ux * sp * 0.8, -uy * sp * 0.8, m.r);
-      else moveEnt(m, -uy * sp * 0.5, ux * sp * 0.5, m.r);
-      if (m.atkT <= 0 && d < 320 && m.see) {
-        m.atkT = 2.3; const el = G.zi.el;
-        G.eprojs.push({ x: m.x, y: m.y, vx: ux * 150, vy: uy * 150, r: 5, life: 3.5, dmg: m.dmg, el, color: EL_COLOR[el] });
-      }
-    } else {
-      const reach = m.r + PLAYER_R + 4;
-      if (d > reach - 2) chase(m, sp);
-      if (d < reach + 4 && m.atkT <= 0) { m.atkT = m.boss ? 1.3 : 1.15; m.lunge = 0.18; damagePlayer(m.dmg, 'phys'); if (G.dead) return; }
-    }
-    if (m.boss) {
-      m.novaT -= dt; m.sumT -= dt;
-      if (m.novaT <= 0) {
-        m.novaT = 4.5; const el = G.zi.el, n = 12, off = rnd(0, 1);
-        for (let k = 0; k < n; k++) { const a = off + k * Math.PI * 2 / n; G.eprojs.push({ x: m.x, y: m.y, vx: Math.cos(a) * 135, vy: Math.sin(a) * 135, r: 6, life: 3.2, dmg: m.dmg * 0.55, el, color: EL_COLOR[el] }); }
-        addFx({ k: 'ring', x: m.x, y: m.y, r: 60, d: 0.3, color: EL_COLOR[el] });
-      }
-      if (m.sumT <= 0) {
-        m.sumT = 9;
-        for (let k = 0; k < 4; k++) {
-          let x = m.x + rnd(-50, 50), y = m.y + rnd(-50, 50);
-          if (!free(x, y, 8)) { x = m.x; y = m.y; }
-          spawnMob(G.areas[G.area], { type: 'swarm', x, y }).awake = true;
-        }
-      }
-    }
+    updateMob(m, dt);
+    if (G.dead) return;
   }
   // keep monsters from stacking on top of each other
-  for (let i = 0; i < awake.length; i++) {
-    const a = awake[i]; if (a.dead) continue;
-    for (let j = i + 1; j < awake.length; j++) {
-      const b = awake[j]; if (b.dead) continue;
+  const ms = G.mobs;
+  for (let i = 0; i < ms.length; i++) {
+    const a = ms[i]; if (a.dead || a.totem) continue;
+    for (let j = i + 1; j < ms.length; j++) {
+      const b = ms[j]; if (b.dead) continue;
       const dx = b.x - a.x, dy = b.y - a.y, rr = a.r + b.r;
       const d2 = dx * dx + dy * dy;
       if (d2 >= rr * rr || d2 === 0) continue;
       const d = Math.sqrt(d2), push = (rr - d) / 2, nx = dx / d, ny = dy / d;
-      const wa = a.boss ? 0 : b.boss ? 2 : 1, wb = b.boss ? 0 : a.boss ? 2 : 1;
+      const wa = a.boss ? 0 : b.boss || b.totem ? 2 : 1, wb = b.boss || b.totem ? 0 : a.boss ? 2 : 1;
       moveEnt(a, -nx * push * wa, -ny * push * wa, a.r); moveEnt(b, nx * push * wb, ny * push * wb, b.r);
     }
   }
-  for (let i = G.mobs.length - 1; i >= 0; i--) if (G.mobs[i].dead) G.mobs.splice(i, 1);
+  for (let i = ms.length - 1; i >= 0; i--) if (ms[i].dead) ms.splice(i, 1);
 
-  // chests open when touched
-  for (const c of G.chests) if (!c.open && dist2(c.x, c.y, pl.x, pl.y) < 34 * 34) openChest(c);
-
-  // loot
+  // room cleared: the door opens and all loot flies to the player
+  if (!G.cleared && !ms.length) {
+    G.cleared = true; G.grid[G.door] = 1; G.eprojs.length = 0;
+    addFx({ k: 'ring', x: (G.door + 0.5) * TILE, y: TILE * 0.5, r: 70, d: 0.6, color: '#9fe6ff', fill: true });
+    UI.onClear();
+  }
   for (let i = G.drops.length - 1; i >= 0; i--) {
     const d = G.drops[i]; d.t += dt;
     const dd = Math.sqrt(dist2(d.x, d.y, pl.x, pl.y));
-    if (d.gold) {
-      if (dd < 130 && d.t > 0.25) { const sp = 320 * dt / Math.max(dd, 1); d.x += (pl.x - d.x) * Math.min(1, sp); d.y += (pl.y - d.y) * Math.min(1, sp); }
-      if (dd < 18) { S.gold += d.gold; addText(pl.x, pl.y - 26, '+' + d.gold, '#ffd84a'); G.drops.splice(i, 1); }
-    } else if (dd < P.pickup && d.t > 0.3) {
-      if (d.sigil) { S.sigils++; UI.toast(SIGIL_NAME + ' found!', '#ff5ad0'); G.drops.splice(i, 1); save(); }
-      else if (d.gem) { S.gems.push(d.gem); UI.toast('Gem found: ' + gemDef(d.gem).name, '#58d8c8'); UI.onLoot('gem'); G.drops.splice(i, 1); }
-      else if (d.item.rarity < S.opts.autoSell) { const v = itemValue(d.item); S.gold += v; addText(pl.x, pl.y - 26, '+' + v, '#ffd84a'); G.drops.splice(i, 1); }
-      else if (S.inv.length < INV_SIZE) {
-        S.inv.push(d.item); if (d.item.rarity >= 2) UI.toast(d.item.name, RARITY_COLOR[d.item.rarity]);
-        UI.onLoot(); G.drops.splice(i, 1);
-      } else if (!d.warned || G.t - d.warned > 4) { d.warned = G.t; UI.toast('Inventory is full', '#ff8a7a'); }
+    if ((G.cleared && d.t > 0.4) || (d.gold && dd < 130 && d.t > 0.25)) {
+      const sp = (G.cleared ? 520 : 320) * dt / Math.max(dd, 1);
+      d.x += (pl.x - d.x) * Math.min(1, sp); d.y += (pl.y - d.y) * Math.min(1, sp);
+    }
+    if (dd < (d.gold ? 18 : P.pickup) && d.t > 0.3) {
+      if (pickUp(d)) G.drops.splice(i, 1);
+      else if (!d.warned || G.t - d.warned > 4) { d.warned = G.t; UI.toast('Inventory is full', '#ff8a7a'); }
     }
   }
   if (G.drops.length > 120) G.drops.splice(0, G.drops.length - 120);
-
-  // which portal is the player standing on
-  G.near = null;
-  for (const p of G.portals) if (dist2(p.x, p.y, pl.x, pl.y) < 40 * 40) G.near = p;
+  if (G.cleared && !R.picks && pl.y < TILE * 0.9 && Math.abs(pl.x - (G.door + 0.5) * TILE) < TILE) { nextRoom(); return; }
 
   for (let i = G.fx.length - 1; i >= 0; i--) { const f = G.fx[i]; f.t += dt; if (f.follow) { f.x = pl.x; f.y = pl.y; } if (f.t >= f.d) G.fx.splice(i, 1); }
   for (let i = G.texts.length - 1; i >= 0; i--) { const t = G.texts[i]; t.t += dt; t.y -= 34 * dt; if (t.t > 0.8) G.texts.splice(i, 1); }
@@ -707,14 +720,14 @@ function unequip(slot) {
 }
 function sellItem(it) { const i = S.inv.indexOf(it); if (i < 0) return; S.inv.splice(i, 1); S.gold += itemValue(it); }
 function sellBelow(rarity) { let n = 0; for (const it of S.inv.slice()) if (it.rarity <= rarity) { sellItem(it); n++; } save(); return n; }
-function socketGem(slot, supIdx, gemId) {
+function socketGem(slot, gemId) {
   const g = gemById(gemId); if (!g) return;
   const prev = gemSocketed(gemId);
-  if (prev) { if (prev.sup < 0) S.slots[prev.slot].skill = null; else S.slots[prev.slot].sup[prev.sup] = null; }
-  if (supIdx < 0) S.slots[slot].skill = gemId; else S.slots[slot].sup[supIdx] = gemId;
+  if (prev) S.slots[prev.slot].skill = null;
+  S.slots[slot].skill = gemId;
   computeStats(); save();
 }
-function unsocket(slot, supIdx) { if (supIdx < 0) S.slots[slot].skill = null; else S.slots[slot].sup[supIdx] = null; computeStats(); save(); }
+function unsocket(slot) { S.slots[slot].skill = null; computeStats(); save(); }
 function buyGem(i) {
   const o = S.shop[i]; if (!o || S.gold < o.price) return false;
   S.gold -= o.price; S.gems.push(o.gem); S.shop.splice(i, 1); save(); return true;

@@ -205,14 +205,14 @@ function itemScore(it) {
 // kind: arc | bolt | nova | chain | orbit | blink | lance | meteor
 const SKILLS = {
   arc: { name: 'Rending Arc', icon: '⚔️', color: '#d8d0c0', kind: 'arc', tags: ['attack', 'melee', 'area', 'phys'], cd: 0.75, eff: 1.4, range: 84,
-    desc: 'Sweeps your weapon in a wide arc, hitting every enemy in front of you.' },
+    desc: 'Sweeps your weapon in a wide arc and sends a cutting wave that passes through enemies.' },
   bolt: { name: 'Ember Bolt', icon: '🔥', color: '#ff8a3c', kind: 'bolt', tags: ['spell', 'projectile', 'fire'], el: 'fire', cd: 0.8, base: 9, eff: 0.8, range: 330,
     desc: 'Hurls a bolt of fire at the nearest enemy.' },
   nova: { name: 'Glacial Burst', icon: '❄️', color: '#8fd8ff', kind: 'nova', tags: ['spell', 'area', 'cold'], el: 'cold', cd: 1.5, base: 11, eff: 0.9, range: 100,
     desc: 'A burst of frost around you. Cold damage chills, slowing enemies.' },
   chain: { name: 'Arc Lash', icon: '⚡', color: '#f7f08a', kind: 'chain', tags: ['spell', 'lightning', 'chain'], el: 'light', cd: 1.0, base: 8, eff: 0.7, range: 260, chain: 3,
     desc: 'Lightning strikes an enemy and leaps to others nearby. Damage is highly variable.' },
-  orbit: { name: 'Whirling Steel', icon: '🌀', color: '#c0c8d8', kind: 'orbit', tags: ['attack', 'orbit', 'area', 'phys'], cd: 0.5, eff: 0.7, range: 62, blades: 3,
+  orbit: { name: 'Whirling Steel', icon: '🌀', color: '#c0c8d8', kind: 'orbit', tags: ['attack', 'orbit', 'area', 'phys'], cd: 0.5, eff: 1.05, range: 62, blades: 3,
     desc: 'Blades circle you constantly, cutting anything they touch.' },
   blink: { name: 'Shadowstep', icon: '👣', color: '#b78cff', kind: 'blink', tags: ['attack', 'melee', 'area', 'phys'], cd: 1.1, eff: 1.9, range: 230,
     desc: 'Teleport to a nearby enemy and strike everything around you.' },
@@ -239,9 +239,8 @@ const SUPPORTS = {
 const GEM_MAX = 20;
 const gemXpNext = l => Math.floor(80 * Math.pow(l, 1.9));
 function makeGem(id, lvl) { return { uid: uid(), id, sup: !!SUPPORTS[id], lvl: lvl || 1, xp: 0 }; }
-function randomGem(supChance) {
-  return Math.random() < (supChance === undefined ? 0.6 : supChance) ? makeGem(pick(Object.keys(SUPPORTS))) : makeGem(pick(Object.keys(SKILLS)));
-}
+// support gems became run abilities; only skill gems drop or are sold now
+function randomGem() { return makeGem(pick(Object.keys(SKILLS))); }
 const gemDef = g => g.sup ? SUPPORTS[g.id] : SKILLS[g.id];
 function supportFits(sd, skillDef) { return !sd.req || sd.req.some(t => skillDef.tags.includes(t)); }
 const SLOT_UNLOCK = [1, 5, 10, 16];
@@ -250,8 +249,9 @@ const SLOT_UNLOCK = [1, 5, 10, 16];
 const MOBS = {
   ghoul: { name: 'Ghoul', hp: 1, dmg: 1, spd: 58, r: 12, color: '#7d8a5c', xp: 1 },
   swarm: { name: 'Gnawer', hp: 0.42, dmg: 0.55, spd: 98, r: 8, color: '#a0564a', xp: 0.5 },
-  brute: { name: 'Brute', hp: 2.8, dmg: 1.8, spd: 40, r: 18, color: '#6d5a7a', xp: 2.4 },
-  caster: { name: 'Cultist', hp: 0.8, dmg: 1.1, spd: 50, r: 11, color: '#4f7f8f', xp: 1.4, ranged: true }
+  brute: { name: 'Charger', hp: 2.4, dmg: 1.6, spd: 40, r: 17, color: '#6d5a7a', xp: 2.2, charge: true },
+  caster: { name: 'Cultist', hp: 0.8, dmg: 1.0, spd: 50, r: 11, color: '#4f7f8f', xp: 1.4, ranged: true },
+  totem: { name: 'Spore Totem', hp: 1.5, dmg: 0.85, spd: 0, r: 14, color: '#5f7a3e', xp: 1.5, totem: true }
 };
 const MOB_MODS = { fast: 'Swift', tough: 'Stalwart', deadly: 'Deadly' };
 const ZONES = [
@@ -268,7 +268,6 @@ const mobHp = L => 20 * (1 + 0.55 * (L - 1) + 0.07 * (L - 1) * (L - 1)) * Math.p
 const mobDmg = L => 6.5 * (1 + 0.25 * (L - 1) + 0.012 * (L - 1) * (L - 1)) * Math.pow(1.02, L - 1);
 const mobXp = L => 5 + 3 * L;
 const xpNext = L => Math.floor(40 * Math.pow(L, 1.6) + 60 * L);
-const zoneQuota = z => Math.min(220, 60 + z * 8);
 
 /* ===== classes ===== */
 const CLASSES = {
@@ -283,15 +282,35 @@ const CLASSES = {
 };
 const HERO_NAMES = ['Kael', 'Mira', 'Dorn', 'Ysolde', 'Varek', 'Thessa', 'Bram', 'Nyx', 'Orin', 'Sable', 'Tyr', 'Elowen'];
 
-/* ===== maps, chests, loot scaling ===== */
-const CHESTS = {
-  wooden: { name: 'Chest', items: [1, 2], rar: 1.5, gold: 5, gem: 0.06, sigil: 0.003 },
-  ornate: { name: 'Ornate Chest', items: [3, 4], rar: 4, gold: 14, gem: 0.3, sigil: 0.012 }
-};
-const SIGIL_NAME = 'Summoning Sigil';
-// every zone deeper: better and more loot, more monsters
-const zoneFind = z => 1 + 0.05 * (z - 1);
-const zoneQuantity = z => Math.min(2, 1 + 0.025 * (z - 1));
-const ornateChance = z => Math.min(0.5, 0.1 + 0.025 * (z - 1));
-const mobCount = z => Math.min(190, 70 + z * 7);
-const mapTiles = z => Math.min(84, 54 + z * 2);
+/* ===== chapters ===== */
+const CH_ROOMS = 20;
+const isBossRoom = r => r % 5 === 0;
+// monster level inside a chapter: each chapter is three levels harder than the one before
+const roomLevel = (ch, r) => 1 + (ch - 1) * 3 + Math.floor((r - 1) / 5);
+// on top of the level, every chapter's monsters are tougher
+const chHp = ch => 1 + 0.15 * (ch - 1), chDmg = ch => 1 + 0.06 * (ch - 1);
+const chapterInfo = ch => zoneInfo(ch);
+// later chapters drop better and more loot
+const zoneFind = L => 1 + 0.05 * (L - 1);
+const zoneQuantity = L => Math.min(2, 1 + 0.025 * (L - 1));
+const MINI_BOSSES = [
+  { name: 'Gorehorn', color: '#8a4a3a', pats: ['dash', 'dash', 'ring'], spd: 70 },
+  { name: 'The Brood Queen', color: '#6a8a3a', pats: ['summon', 'fan', 'fan'], spd: 52 },
+  { name: 'Hollow Sentinel', color: '#5a6a9a', pats: ['spiral', 'fan', 'ring'], spd: 40 }
+];
+const BOSS_COLOR = { fire: '#a8462a', cold: '#3a6a8a', phys: '#6a5a3a', light: '#7a6a2a' };
+
+/* ===== run abilities: picked 1 of 3 on every level-up during a run ===== */
+const ABILITIES = {};
+for (const id in SUPPORTS) ABILITIES[id] = Object.assign({ max: 3, sup: true }, SUPPORTS[id]);
+ABILITIES.echo.max = 2;
+Object.assign(ABILITIES, {
+  fury: { name: 'Fury', icon: '😤', stats: { dmgPct: 20 }, max: 5, desc: '20% increased damage.' },
+  vital: { name: 'Vitality', icon: '💗', stats: { lifePct: 20 }, heal: 0.2, max: 5, desc: '20% increased maximum life, and heal 20% of it now.' },
+  ward: { name: 'Iron Skin', icon: '🪨', stats: { armourPct: 40, resAll: 10 }, max: 4, desc: '40% increased armour and +10% to all elemental resistances.' },
+  evade: { name: 'Evasion', icon: '🌫️', stats: { dodge: 7 }, max: 4, desc: '+7% chance to dodge hits.' },
+  swift: { name: 'Fleet Step', icon: '💨', stats: { moveSpeed: 12 }, max: 3, desc: '12% increased movement speed.' },
+  troll: { name: 'Troll Blood', icon: '🧪', stats: { regenPct: 0.8 }, max: 3, desc: 'Regenerate 0.8% of your life per second.' },
+  mend: { name: 'Second Wind', icon: '✚', heal: 0.5, max: 99, desc: 'Heal 50% of your maximum life now.' }
+});
+const runXpNext = l => 4 + 2 * l;
