@@ -1,745 +1,377 @@
 'use strict';
-/* ===== state ===== */
-const SAVE_KEY = 'cindermarch_v2', OLD_SAVE_KEY = 'cindermarch_v1';
-const LEVEL_CAP = 80, PLAYER_R = 11, MAX_CHARS = 8;
-let SAVE = null;   // everything that is stored: all characters
-let S = null;      // the character being played
-let P = null;      // its computed stats
-let R = null;      // the current run: chapter, room, run level, abilities picked
-let G = null;      // the current room
-const VIEW = { w: 420, h: 800 };   // logical view size, set by render.js
-const input = { x: 0, y: 0 };
-let statsDirty = false;
-const UI = { toast() {}, onLevel() {}, onDeath() {}, onRoom() {}, onLoot() {}, onClear() {}, onRunEnd() {} };   // filled in by ui.js
+/* ===== game flow: save, characters, equipment stats, runs, tower, world boss, rewards, shop, tree ===== */
+const SAVE_KEY = 'cindermarch_v3';
+let S = null;                 // whole save
+let CH = null;                // current character
+let RS = null;                // current session (run / tower / world boss) state that is saved
+let MODE = 'menu';            // 'menu' | 'run' | 'tower' | 'wb'
+const uid = () => Math.random().toString(36).slice(2, 10);
+const today = () => { const d = new Date(); return d.getFullYear() + '-' + (d.getMonth() + 1) + '-' + d.getDate(); };
+const weekId = () => { const d = new Date(); const day = (d.getDay() + 6) % 7; const m = new Date(d.getFullYear(), d.getMonth(), d.getDate() - day); return m.toDateString(); };
 
-function save() {
-  if (!SAVE) return;
-  try { localStorage.setItem(SAVE_KEY, JSON.stringify(SAVE)); } catch (e) { /* storage unavailable */ }
-}
-function fixChar(c) {
-  c.id = c.id || uid();
-  if (!CLASSES[c.cls]) {
-    const first = c.gems && c.slots && c.gems.find(g => g.uid === c.slots[0].skill);
-    c.cls = { arc: 'warden', orbit: 'reaver', blink: 'stalker', bolt: 'arcanist', chain: 'arcanist' }[first && first.id] || 'warden';
-  }
-  c.name = c.name || 'Exile';
-  c.opts = c.opts || { autoSell: 0 };
-  c.stats = c.stats || { kills: 0, deaths: 0 };
-  c.shop = c.shop && c.shop.every(o => o && o.gem && !o.gem.sup) ? c.shop : [];
-  // chapters replace the old zones: three zones' worth of difficulty per chapter
-  c.maxCh = c.maxCh || Math.max(1, Math.ceil((c.maxZone || 1) / 3));
-  c.chSel = clamp(c.chSel || c.maxCh, 1, c.maxCh);
-  c.best = c.best || {};
-  // support gems are run abilities now: refund them
-  const sup = c.gems.filter(g => g.sup);
-  if (sup.length) { c.gold += 60 * sup.length; c.gems = c.gems.filter(g => !g.sup); }
-  c.slots = c.slots.map(s => ({ skill: s && c.gems.some(g => g.uid === s.skill) ? s.skill : null }));
-  delete c.v; delete c.zone; delete c.maxZone; delete c.zs; delete c.sigils;
-}
-function loadSave() {
-  SAVE = null;
-  try {
-    const raw = localStorage.getItem(SAVE_KEY);
-    if (raw) { const d = JSON.parse(raw); if (d && d.v === 2 && Array.isArray(d.chars)) SAVE = d; }
-    if (!SAVE) {   // a character from version 1.0.0
-      const old = localStorage.getItem(OLD_SAVE_KEY);
-      if (old) { const d = JSON.parse(old); if (d && d.v === 1 && d.slots && d.tree) SAVE = { v: 2, chars: [d], sel: 0 }; }
-    }
-  } catch (e) { SAVE = null; }
-  if (!SAVE) SAVE = { v: 2, chars: [], sel: 0 };
-  SAVE.chars = SAVE.chars.filter(c => c && c.slots && c.tree && c.equip && c.gems);
-  SAVE.chars.forEach(fixChar);
-  SAVE.sel = clamp(SAVE.sel | 0, 0, Math.max(0, SAVE.chars.length - 1));
-}
-function createChar(cls, name) {
-  const C = CLASSES[cls];
-  const c = { id: uid(), cls, name: name || pick(HERO_NAMES), level: 1, xp: 0, gold: 0, inv: [], equip: {}, gems: [],
-    slots: [0, 1, 2, 3].map(() => ({ skill: null })), tree: ['start'], maxCh: 1, chSel: 1, best: {}, shop: [],
-    opts: { autoSell: 0 }, stats: { kills: 0, deaths: 0 } };
-  const g = makeGem(C.skill);
-  c.gems.push(g); c.slots[0].skill = g.uid;
-  c.equip.weapon = makeItem(1, { slot: 'weapon', rarity: 0, wtype: C.wtype });
-  SAVE.chars.push(c);
-  return SAVE.chars.length - 1;
-}
-function selectChar(i) {
-  S = SAVE.chars[i]; SAVE.sel = i; R = null; G = null;
-  if (!S.shop.length) rollShop();
-  computeStats();
-  save();
-}
-function deleteChar(i) { SAVE.chars.splice(i, 1); SAVE.sel = clamp(SAVE.sel, 0, Math.max(0, SAVE.chars.length - 1)); save(); }
-function exitToTitle() { save(); S = null; P = null; R = null; G = null; input.x = input.y = 0; }
+// ---------- support state used by combat (RUN.*) ----------
+const RUN = {
+  sup: {},
+  supLvl(skill, s) { if (!skill) return 0; const q = this.sup[s]; if (!q || q.gone) return 0; return SUPPORTS[s].gems.includes(skill) ? q.lvl : 0; },
+  anySup(s) { const q = this.sup[s]; return q && !q.gone ? q.lvl : 0; },
+  corr(s) { const q = this.sup[s]; return !!(q && !q.gone && q.fx); },
+  rotDur() { return Math.max(1, rotationSlots().length) * castInterval(); },
+  gainXp(v) { sessionXp(v); }, gainGold(n) { if (RS) RS.gold += Math.round(n * goldPerOrb()); },
+  onKill(e) { sessionKill(e); },
+};
 
-/* ===== character stats ===== */
-const gemById = id => id ? S.gems.find(g => g.uid === id) : null;
-const slotUnlocked = i => S.level >= SLOT_UNLOCK[i];
-const passivePoints = () => S.level - 1 - (S.tree.length - 1);
-function gemSocketed(id) { for (let i = 0; i < 4; i++) if (S.slots[i].skill === id) return { slot: i }; return null; }
-function computeStats() {
-  const st = {};
-  const add = (src, n) => { for (const k in src) st[k] = (st[k] || 0) + src[k] * (n || 1); };
-  add(CLASSES[S.cls].stats);
-  for (const sl of EQUIP_SLOTS) if (S.equip[sl]) add(itemStats(S.equip[sl]));
-  for (const id of S.tree) { const n = TREE.nodes[id]; if (n) add(n.stats); }
-  if (R) for (const id in R.abil) { const a = ABILITIES[id]; if (a.stats) add(a.stats, R.abil[id]); }
-  const g = k => st[k] || 0;
-  const p = { raw: st };
-  p.maxLife = Math.max(10, Math.round((80 + 10 * (S.level - 1) + g('life')) * (1 + g('lifePct') / 100)));
-  p.regen = g('regen') + p.maxLife * (0.6 + g('regenPct')) / 100;
-  p.armour = Math.max(0, Math.round(g('armour') * (1 + g('armourPct') / 100)));
-  p.dodge = clamp(g('dodge'), 0, 60);
-  p.speed = 130 * Math.max(0.4, 1 + g('moveSpeed') / 100);
-  p.res = { fire: Math.min(75, g('resFire') + g('resAll')), cold: Math.min(75, g('resCold') + g('resAll')), light: Math.min(75, g('resLight') + g('resAll')) };
-  p.crit = 5 + g('crit'); p.critMulti = 150 + g('critMulti');
-  p.skillSpeed = Math.max(0.3, 1 + g('atkSpeed') / 100);
-  p.area = Math.max(0.3, 1 + g('areaPct') / 100);
-  p.leech = g('leech'); p.lifeOnKill = g('lifeOnKill');
-  p.rarity = 1 + g('rarityPct') / 100; p.gold = 1 + g('goldPct') / 100; p.pickup = 46;
-  const w = S.equip.weapon, wm = 1 + g('wPct') / 100;
-  p.wMin = w ? w.wMin * wm : 1; p.wMax = w ? w.wMax * wm : 3;
-  P = p;
-  p.skills = [0, 1, 2, 3].map(skillInfo);
-  if (G && G.player) G.player.life = Math.min(G.player.life, p.maxLife);
-  statsDirty = false;
+// ---------- save ----------
+function load() {
+  try { S = JSON.parse(localStorage.getItem(SAVE_KEY)); } catch (e) { S = null; }
+  if (!S || !S.chars) S = { chars: [], cur: null, set: { autoSell: 0, sound: 1 } };
+  CH = S.chars.find(c => c.id === S.cur) || null;
 }
-// abilities picked during the run change every skill they fit, the way support gems used to
-function skillInfo(i) {
-  const sl = S.slots[i];
-  if (!slotUnlocked(i) || !sl.skill) return null;
-  const gem = gemById(sl.skill); if (!gem) return null;
-  const d = SKILLS[gem.id], l = gem.lvl, st = P.raw, g = k => st[k] || 0;
-  let more = 1 + g('moreDmg') / 100, cdm = 1, area = P.area, proj = 0, pierce = d.pierce || 0, chain = d.chain || 0;
-  let crit = P.crit, cm = P.critMulti, leech = P.leech, ignite = 0, echo = 0;
-  const sups = [];
-  if (R) for (const id in R.abil) {
-    const sd = ABILITIES[id], n = R.abil[id];
-    if (!sd.sup || !supportFits(sd, d)) continue;
-    sups.push(sd);
-    if (sd.more) more *= sd.more < 1 ? sd.more : Math.pow(sd.more, n);   // a penalty is paid once, a bonus stacks
-    if (sd.cd) cdm *= sd.cd < 1 ? Math.pow(sd.cd, n) : sd.cd;
-    if (sd.area) area *= Math.pow(sd.area, n);
-    if (sd.proj) proj += sd.proj * n;
-    if (sd.pierce) pierce += sd.pierce * n;
-    if (sd.chain) chain += sd.chain * n;
-    if (sd.crit) crit += sd.crit * n;
-    if (sd.critMulti) cm += sd.critMulti * n;
-    if (sd.leech) leech += sd.leech * n;
-    if (sd.ignite) ignite += sd.ignite * n;
-    if (sd.echo) echo = n;
-  }
-  const isAtk = d.tags.includes('attack');
-  if (isAtk) more *= 1 + g('moreAtk') / 100;
-  const dmg = { phys: 0, fire: 0, cold: 0, light: 0 };
-  const eff = isAtk ? d.eff * (1 + 0.035 * (l - 1)) : d.eff;
-  if (isAtk) dmg.phys += (P.wMin + P.wMax) / 2 * eff; else dmg[d.el] += d.base * (1 + 0.32 * (l - 1));
-  dmg.phys += g('addPhys') * eff; dmg.fire += g('addFire') * eff; dmg.cold += g('addCold') * eff; dmg.light += g('addLight') * eff;
-  const incG = g('dmgPct') + (isAtk ? g('attackPct') : g('spellPct'));
-  const inc = { phys: g('physPct'), fire: g('firePct') + g('elePct'), cold: g('coldPct') + g('elePct'), light: g('lightPct') + g('elePct') };
-  let avg = 0;
-  for (const t in dmg) { dmg[t] *= Math.max(0.1, 1 + (incG + inc[t]) / 100) * more * (t === 'fire' ? 1 + g('moreFire') / 100 : 1); avg += dmg[t]; }
-  const cd = Math.max(0.12, d.cd * cdm / P.skillSpeed);
-  crit = clamp(crit, 0, 100);
-  let dps = avg * (1 + crit / 100 * (cm / 100 - 1)) / cd * (1 + ignite) * (1 + echo);
-  if (d.kind === 'bolt') dps *= 1 + proj * 0.5;
-  return { i, def: d, gem, cd, dmg, avg, crit, critMulti: cm, area, proj, pierce, chain, leech, ignite, echo, sups, dps };
-}
-function rollShop() {
-  S.shop = [];
-  const owned = new Set(S.gems.map(g => g.id));
-  for (let i = 0; i < 3; i++) {
-    let g = randomGem(), tries = 0;
-    while ((owned.has(g.id) || S.shop.some(o => o.gem.id === g.id)) && tries++ < 12) g = randomGem();
-    S.shop.push({ gem: g, price: Math.round(140 * (1 + 0.9 * (S.maxCh - 1))) });
-  }
-}
-const refreshCost = () => Math.round(40 * (1 + 0.9 * (S.maxCh - 1)));
-function refreshShop() { const c = refreshCost(); if (S.gold < c) return false; S.gold -= c; rollShop(); save(); return true; }
+function save() { try { if (CH && RS) CH.session = RS; else if (CH) CH.session = null; localStorage.setItem(SAVE_KEY, JSON.stringify(S)); } catch (e) {} }
 
-/* ===== the run ===== */
-function startRun(ch) {
-  ch = clamp(ch, 1, S.maxCh);
-  S.chSel = ch;
-  R = { ch, room: 1, lvl: 1, xp: 0, abil: {}, picks: 1, why: 'start', offer: null, kills: 0, gold0: S.gold, items: 0, gems: 0, t0: Date.now(), over: false };
-  computeStats();
-  startRoom(true);
-  G.player.life = P.maxLife;
-  save();
+// ---------- characters (Schéma 2) ----------
+function newChar(name, gender, el) {
+  const [wt, gem] = STARTER[el];
+  const c = { id: uid(), name: name || 'Poutník', gender, el, lvl: 1, xp: 0, gold: 0, dia: START_DIAMONDS, energy: TOWER.maxEnergy, energyT: Date.now(), keys: WB_KEYS_PER_DAY, keyDay: today(),
+    items: [], gems: [], sgems: [], equip: {}, tree: [0], prog: { maxCh: [1, 0, 0], cleared: {} }, runsDone: 0, tower: { floor: [1, 0, 0], best: [0, 0, 0] },
+    wb: { day: today(), dmg: 0, claimed: 0, killed: 0, tierBest: -1, week: weekId(), weekKills: [0, 0, 0, 0], weekLoot: [{ g: 0, d: 0 }, { g: 0, d: 0 }, { g: 0, d: 0 }, { g: 0, d: 0 }], wbTier: 0 },
+    shop: null, zoneReached: 1, created: Date.now() };
+  const w = makeItem('weapon', 0, wt); c.items.push(w); c.equip.weapon = w.id;
+  const g = { id: uid(), sk: gem }; c.gems.push(g); w.gem = g.id;
+  S.chars.push(c); S.cur = c.id; CH = c; save(); return c;
 }
-function startRoom(first) {
-  const L = roomLevel(R.ch, R.room), life = G && !first ? G.player.life : P.maxLife;
-  const room = genRoom(Math.floor(Math.random() * 2147483647), R.ch, R.room);
-  G = { zi: Object.assign(chapterInfo(R.ch), { level: L }), t: 0, W: room.W, H: room.H, grid: room.grid, door: DOOR_X,
-    mobs: [], projs: [], eprojs: [], fx: [], drops: [], texts: [], delayed: [], cds: [0, 0, 0, 0], shake: 0, dead: false,
-    cleared: false, flow: new Int16Array(room.W * room.H), flowT: 0, boss: isBossRoom(R.room),
-    player: { x: START.x, y: START.y, life: Math.min(life, P.maxLife), face: -Math.PI / 2, walk: 0, flash: 0, blink: 0, castT: -9, hurt: 0 } };
-  for (const sp of room.spawns) spawnMob(sp);
-  UI.onRoom();
-}
-function spawnMob(sp) {
-  const L = G.zi.level;
-  if (sp.type === 'boss') return spawnBoss(sp, L);
-  const d = MOBS[sp.type], rar = sp.rar || 0;
-  let x = sp.x, y = sp.y;
-  if (!walk(x, y)) { x = (Math.floor(x / TILE) + 0.5) * TILE; y = (Math.floor(y / TILE) + 0.5) * TILE; }
-  const m = { type: sp.type, x, y, r: d.r, spd: d.spd * rnd(0.9, 1.1), hp: mobHp(L) * d.hp * chHp(R.ch), dmg: mobDmg(L) * d.dmg * chDmg(R.ch), xp: mobXp(L) * d.xp, rar,
-    color: d.color, atkT: rnd(0.8, 1.8), chill: 0, burn: 0, burnT: 0, flash: 0, orbT: 0, mods: [], wob: rnd(0, 6.28), name: d.name, dead: false, lunge: 0,
-    ranged: !!d.ranged, totem: !!d.totem, charge: !!d.charge, st: 'walk', stT: rnd(1.5, 3), ang: 0, losT: 0, see: false };
-  const mk = Object.keys(MOB_MODS);
-  if (rar === 1) { m.hp *= 2; m.xp *= 2.5; m.mods = [pick(mk)]; }
-  if (rar === 2) { m.hp *= 4; m.xp *= 6; m.r *= 1.2; m.dmg *= 1.2; const a = pick(mk); m.mods = [a, pick(mk.filter(k => k !== a))]; }
-  for (const mod of m.mods) { if (mod === 'fast') m.spd *= 1.3; if (mod === 'tough') m.hp *= 1.5; if (mod === 'deadly') m.dmg *= 1.35; }
-  if (rar) m.name = m.mods.map(k => MOB_MODS[k]).join(' ') + ' ' + d.name;
-  m.maxHp = m.hp;
-  G.mobs.push(m);
-  return m;
-}
-function spawnBoss(sp, L) {
-  const fin = sp.final, B = fin ? { name: G.zi.boss, color: BOSS_COLOR[G.zi.el] || '#8a4a3a', pats: ['ring', 'dash', 'spiral', 'fan', 'summon'], spd: 60 } : MINI_BOSSES[sp.idx % MINI_BOSSES.length];
-  const m = { type: 'boss', boss: true, final: fin, x: sp.x, y: sp.y, r: fin ? 32 : 26, spd: B.spd, pats: B.pats, pi: 0, name: B.name, color: B.color,
-    hp: mobHp(L) * chHp(R.ch) * (fin ? 24 + 3 * R.ch : 10 + 2 * R.ch), dmg: mobDmg(L) * chDmg(R.ch) * (fin ? 1.8 : 1.5), xp: mobXp(L) * (fin ? 40 : 20), rar: 3,
-    atkT: 1, chill: 0, burn: 0, burnT: 0, flash: 0, orbT: 0, mods: [], wob: 0, dead: false, lunge: 0, st: 'idle', stT: 1.6, ang: 0, emitT: 0, n: 0, losT: 0, see: false };
-  m.maxHp = m.hp;
-  G.mobs.push(m);
-  return m;
-}
-const bossMob = () => G && G.mobs.find(m => m.boss && !m.dead) || null;
-// leaving through the door: loot still lying around is picked up on the way out
-function collectAll() {
-  for (const d of G.drops) pickUp(d, true);
-  G.drops.length = 0;
-}
-function nextRoom() {
-  collectAll();
-  if (R.room >= CH_ROOMS) { endRun(true); return; }
-  R.room++;
-  startRoom(false);
-  save();
-}
-function endRun(won, abandoned) {
-  if (!R || R.over) return;
-  if (G) collectAll();
-  R.over = true; R.won = won;
-  const cleared = won ? CH_ROOMS : R.room - 1 + (G && G.cleared ? 1 : 0);
-  R.cleared = cleared;
-  if (cleared > (S.best[R.ch] || 0)) { S.best[R.ch] = cleared; R.newBest = true; }
-  if (won) {
-    R.bonus = Math.round((60 + 40 * R.ch) * R.ch * P.gold);
-    S.gold += R.bonus;
-    if (R.ch >= S.maxCh) { S.maxCh = R.ch + 1; R.unlocked = true; rollShop(); }
-    S.chSel = Math.min(S.maxCh, R.ch + 1);
-  }
-  R.abandoned = !!abandoned;
-  input.x = input.y = 0;
-  save();
-  UI.onRunEnd();
-}
-function leaveRun() { R = null; G = null; computeStats(); save(); }
+function selectChar(id) { S.cur = id; CH = S.chars.find(c => c.id === id); save(); }
+function deleteChar(id) { S.chars = S.chars.filter(c => c.id !== id); if (S.cur === id) { S.cur = null; CH = null; } save(); }
 
-/* ===== run level and the 1-of-3 ability choice ===== */
-function gainRunXp(x) {
-  R.xp += x;
-  while (R.xp >= runXpNext(R.lvl)) { R.xp -= runXpNext(R.lvl); R.lvl++; R.picks++; R.why = R.why === 'boss' ? 'boss' : 'level'; }
+// ---------- items (Schéma 1) ----------
+function makeItem(slot, rar, type) {
+  const it = { id: uid(), slot, rar, lvl: 1, spent: 0, gem: null };
+  if (slot === 'weapon') it.type = type || pick(Object.keys(WEAPONS));
+  else if (slot === 'offhand') it.type = type || 'shield';
+  else if (slot === 'ring1' || slot === 'ring2') it.stat = rnd() < 0.5 ? 'dmg' : 'hp';
+  else if (slot === 'amulet') it.stat = rnd() < 0.5 ? 'dmg' : 'as';
+  return it;
 }
-function abilityOk(id) {
-  const a = ABILITIES[id], n = R.abil[id] || 0;
-  if (n >= a.max) return false;
-  if (a.sup) return P.skills.some(s => s && supportFits(a, s.def));
-  return true;
+function itemName(it) {
+  if (it.rar === 3) return UNIQUE_NAMES[it.slot] || 'Unikát';
+  if (it.slot === 'weapon') return WEAPONS[it.type].name;
+  if (it.slot === 'offhand') return it.type === 'wand' ? 'Hůlka (druhá)' : SHIELD.name;
+  return SLOT[it.slot].name;
 }
-function rollAbilities() {
-  const ids = Object.keys(ABILITIES).filter(abilityOk), out = [];
-  const weight = id => id === 'mend' ? (G.player.life < P.maxLife * 0.6 ? 2 : 0.4) : ABILITIES[id].sup ? 1.4 : 1;
-  while (out.length < 3 && ids.length) {
-    let tot = 0; for (const id of ids) tot += weight(id);
-    let r = Math.random() * tot, k = 0;
-    for (; k < ids.length - 1; k++) { r -= weight(ids[k]); if (r <= 0) break; }
-    out.push(ids.splice(k, 1)[0]);
-  }
-  return out;
+// main stat value of an item: {k: 'dmg'|'hp'|'armour'|'as', v}
+function itemStat(it) {
+  const m = RARITY[it.rar].mult, L = it.lvl;
+  if (it.slot === 'weapon') return { k: 'dmg', v: WEAPONS[it.type].dmg * itemScale(L) * m };
+  if (it.slot === 'offhand') return it.type === 'wand' ? { k: 'dmg', v: WEAPONS.wand.dmg * 0.5 * itemScale(L) * m } : { k: 'armour', v: SHIELD.base * itemScale(L) * m };
+  const s = SLOT[it.slot];
+  if (it.stat) { const b = s.base[it.stat]; return { k: it.stat, v: it.stat === 'as' ? b * asScale(L) * m : b * itemScale(L) * m }; }
+  return { k: s.stat, v: s.stat === 'as' ? s.base * asScale(L) * m : s.base * itemScale(L) * m };
 }
-function takeAbility(id) {
-  if (!R || !R.offer || !R.offer.includes(id)) return;
-  const a = ABILITIES[id];
-  R.abil[id] = (R.abil[id] || 0) + 1;
-  computeStats();
-  if (a.heal) heal(P.maxLife * a.heal);
-  R.picks = Math.max(0, R.picks - 1); R.offer = null; R.why = 'level';
-  save();
+const STATNAME = { dmg: 'dmg', hp: 'HP', armour: 'armour', as: '% rychlost útoku' };
+const statText = s => s.k === 'as' ? '+' + s.v.toFixed(1) + STATNAME.as : '+' + fmt(s.v) + ' ' + STATNAME[s.k];
+const itemById = id => CH.items.find(i => i.id === id);
+const gemById = id => CH.gems.find(g => g.id === id) || CH.sgems.find(g => g.id === id);
+const equipped = slot => CH.equip[slot] ? itemById(CH.equip[slot]) : null;
+const offhandUnlocked = () => CH.tree.some(n => TREE_DATA.nodes[n] && TREE_DATA.nodes[n][4] === 'offhand');
+function canEquip(it) {
+  const w = equipped('weapon');
+  if (it.slot === 'offhand') { if (!offhandUnlocked()) return 'Off-hand se odemyká ve skill tree (Dual Mastery).'; if (!w) return null; if (WEAPONS[w.type].hands === 2) return 'Obouruční zbraň nemá off-hand.'; if (w.type === 'wand' && it.type !== 'wand') return 'K hůlce jde jen druhá hůlka.'; if (w.type === 'mace' && it.type !== 'shield') return 'K palcátu jde jen štít.'; }
+  return null;
 }
-
-/* ===== room queries ===== */
-const tileAt = (x, y) => { const tx = Math.floor(x / TILE), ty = Math.floor(y / TILE); return tx >= 0 && ty >= 0 && tx < G.W && ty < G.H ? G.grid[ty * G.W + tx] : 0; };
-const walk = (x, y) => tileAt(x, y) === 1;
-// shots fly over pits but stop at walls, rocks and the closed door
-const solid = (x, y) => { const t = tileAt(x, y); return t === 0 || t === 2 || t === 4; };
-function free(x, y, r) { r *= 0.75; return walk(x - r, y - r) && walk(x + r, y - r) && walk(x - r, y + r) && walk(x + r, y + r); }
-function moveEnt(e, dx, dy, r) {
-  if (!free(e.x, e.y, r)) {   // squeezed against a wall: let it step out instead of freezing in place
-    if (walk(e.x + dx, e.y + dy)) { e.x += dx; e.y += dy; }
-    return false;
-  }
-  let moved = false;
-  if (dx && free(e.x + dx, e.y, r)) { e.x += dx; moved = true; }
-  if (dy && free(e.x, e.y + dy, r)) { e.y += dy; moved = true; }
-  return moved;
-}
-function los(x0, y0, x1, y1, walking) {
-  const n = Math.ceil(Math.hypot(x1 - x0, y1 - y0) / 5);
-  for (let i = 1; i < n; i++) {
-    const x = x0 + (x1 - x0) * i / n, y = y0 + (y1 - y0) * i / n;
-    if (walking ? !walk(x, y) : solid(x, y)) return false;
-  }
-  return true;
-}
-// steps to the player from every tile, so monsters find their way around rocks and pits
-const FLOW_Q = new Int32Array(ROOM_W * ROOM_H + 8);
-function updateFlow() {
-  const W = G.W, H = G.H, f = G.flow, g = G.grid, pl = G.player;
-  f.fill(32767);
-  const s = Math.floor(pl.y / TILE) * W + Math.floor(pl.x / TILE);
-  if (s < 0 || s >= W * H || g[s] !== 1) return;
-  let h = 0, t = 0; f[s] = 0; FLOW_Q[t++] = s;
-  while (h < t) {
-    const c = FLOW_Q[h++], d = f[c] + 1, x = c % W;
-    if (x > 0 && g[c - 1] === 1 && f[c - 1] > d) { f[c - 1] = d; FLOW_Q[t++] = c - 1; }
-    if (x < W - 1 && g[c + 1] === 1 && f[c + 1] > d) { f[c + 1] = d; FLOW_Q[t++] = c + 1; }
-    if (c >= W && g[c - W] === 1 && f[c - W] > d) { f[c - W] = d; FLOW_Q[t++] = c - W; }
-    if (c < W * (H - 1) && g[c + W] === 1 && f[c + W] > d) { f[c + W] = d; FLOW_Q[t++] = c + W; }
-  }
-}
-function canWalkTo(m) {
-  if (m.losT <= G.t) { m.losT = G.t + 0.25; m.see = los(m.x, m.y, G.player.x, G.player.y, true); }
-  return m.see;
-}
-function stepToward(m, tx, ty, sp) { const dx = tx - m.x, dy = ty - m.y, d = Math.hypot(dx, dy) || 1; moveEnt(m, dx / d * sp, dy / d * sp, m.r); }
-function chase(m, sp) {
-  const pl = G.player;
-  if (canWalkTo(m)) { stepToward(m, pl.x, pl.y, sp); return; }
-  const W = G.W, H = G.H, f = G.flow, g = G.grid, tx = Math.floor(m.x / TILE), ty = Math.floor(m.y / TILE);
-  if (tx < 0 || ty < 0 || tx >= W || ty >= H) return;
-  let best = f[ty * W + tx], bx = -1, by = -1;
-  for (let oy = -1; oy <= 1; oy++) for (let ox = -1; ox <= 1; ox++) {
-    if (!ox && !oy) continue;
-    const nx = tx + ox, ny = ty + oy;
-    if (nx < 0 || ny < 0 || nx >= W || ny >= H || g[ny * W + nx] !== 1) continue;
-    if (ox && oy && (g[ty * W + nx] !== 1 || g[ny * W + tx] !== 1)) continue;   // no cutting corners
-    if (f[ny * W + nx] < best) { best = f[ny * W + nx]; bx = nx; by = ny; }
-  }
-  if (bx >= 0) stepToward(m, (bx + 0.5) * TILE, (by + 0.5) * TILE, sp);
-}
-
-/* ===== combat ===== */
-function addText(x, y, txt, color, big) { if (G.texts.length < 60) G.texts.push({ x: x + rnd(-6, 6), y, txt, color, big, t: 0 }); }
-function addFx(o) { if (G.fx.length < 140) { o.t = 0; G.fx.push(o); } }
-function heal(v) { const pl = G && G.player; if (pl) pl.life = Math.min(P.maxLife, pl.life + v); }
-// a shot of some width gets through: checks the centre line and both edges
-function losWide(x0, y0, x1, y1, w) {
-  const d = Math.hypot(x1 - x0, y1 - y0) || 1, nx = -(y1 - y0) / d * w, ny = (x1 - x0) / d * w;
-  return los(x0, y0, x1, y1) && los(x0 + nx, y0 + ny, x1 + nx, y1 + ny) && los(x0 - nx, y0 - ny, x1 - nx, y1 - ny);
-}
-function nearestMob(x, y, range, exclude) {
-  let best = null, bd = range * range;
-  for (const m of G.mobs) {
-    if (m.dead || (exclude && exclude.includes(m))) continue;
-    const d = dist2(x, y, m.x, m.y) - m.r * m.r;
-    if (d < bd && losWide(x, y, m.x, m.y, 5)) { bd = d; best = m; }
-  }
-  return best;
-}
-function mobsInRange(x, y, r) { const out = []; for (const m of G.mobs) if (!m.dead && dist2(x, y, m.x, m.y) < (r + m.r) * (r + m.r)) out.push(m); return out; }
-function hitMob(m, info, mult) {
-  if (m.dead) return;
-  const d = info.dmg;
-  let total = d.phys * rnd(0.8, 1.2) + d.fire * rnd(0.8, 1.2) + d.cold * rnd(0.8, 1.2) + d.light * rnd(0.45, 1.55);
-  total *= mult || 1;
-  const crit = Math.random() * 100 < info.crit;
-  if (crit) total *= info.critMulti / 100;
-  if (m.chill > 0 && P.raw.chillBonus) total *= 1 + P.raw.chillBonus / 100;
-  if (d.cold > 0) m.chill = 2;
-  if (info.ignite) { m.burn = Math.max(m.burn, total * info.ignite / 3); m.burnT = 3; }
-  if (info.leech) heal(total * info.leech / 100);
-  damageMob(m, total, crit);
-}
-function damageMob(m, amt, crit, quiet) {
-  if (m.dead) return;
-  m.hp -= amt; m.flash = 0.1;
-  if (!quiet) addText(m.x, m.y - m.r, String(Math.max(1, Math.round(amt))), crit ? '#ffd84a' : '#ffffff', crit);
-  if (m.hp <= 0) killMob(m);
-}
-function gainXp(x) {
-  if (S.level < LEVEL_CAP) {
-    S.xp += x;
-    while (S.level < LEVEL_CAP && S.xp >= xpNext(S.level)) {
-      S.xp -= xpNext(S.level); S.level++;
-      statsDirty = true;
-      computeStats();
-      addFx({ k: 'ring', x: G.player.x, y: G.player.y, r: 120, d: 0.7, color: '#ffe9a0', follow: true });
-      UI.onLevel();
-    }
-  }
-  for (const s of S.slots) {
-    const g = gemById(s.skill); if (!g || g.lvl >= GEM_MAX) continue;
-    g.xp += x;
-    while (g.lvl < GEM_MAX && g.xp >= gemXpNext(g.lvl)) { g.xp -= gemXpNext(g.lvl); g.lvl++; statsDirty = true; UI.toast(SKILLS[g.id].name + ' reached level ' + g.lvl, '#58d8c8'); }
-  }
-}
-function dropAt(x, y, o, spread) {
-  spread = spread || 14;
-  o.x = x + rnd(-spread, spread); o.y = y + rnd(-spread, spread);
-  if (!walk(o.x, o.y)) { o.x = x; o.y = y; }
-  o.t = 0; G.drops.push(o);
-}
-function killMob(m) {
-  m.dead = true; S.stats.kills++; R.kills++;
-  const L = G.zi.level, diff = S.level - L, find = zoneFind(L), qty = zoneQuantity(L);
-  gainXp(m.xp * (diff > 4 ? Math.max(0.1, 1 - (diff - 4) * 0.15) : 1));
-  gainRunXp(m.boss ? (m.final ? 10 : 6) : [1, 2, 4][m.rar]);
-  if (P.lifeOnKill) heal(P.lifeOnKill);
-  addFx({ k: 'burst', x: m.x, y: m.y, r: m.r * 2.2, d: 0.35, color: m.color });
-  const ri = m.boss ? 3 : m.rar;
-  if (Math.random() < [0.4, 0.8, 1, 1][ri]) dropAt(m.x, m.y, { gold: Math.max(1, Math.round((3 + L * 1.6) * rnd(0.6, 1.4) * [1, 2, 4, 12][ri] * P.gold)) });
-  const n = m.boss ? (m.final ? 4 : 2) : (Math.random() < [0.06, 0.25, 0.8][m.rar] * qty ? 1 : 0);
-  for (let i = 0; i < n; i++) dropAt(m.x, m.y, { item: makeItem(L + (m.boss ? 1 : 0), { rarityMult: P.rarity * find * [1, 1.5, 2.5, 4][ri], rarity: m.boss && i === 0 ? (m.final ? 2 : 1) : undefined }) }, m.boss ? 34 : 14);
-  if (Math.random() < [0.004, 0.015, 0.06, m.final ? 0.6 : 0.2][ri]) dropAt(m.x, m.y, { gem: randomGem() });
-  if (m.boss) {
-    S.stats.bosses = (S.stats.bosses || 0) + 1;
-    for (const o of G.mobs) if (!o.dead && o !== m) { o.dead = true; addFx({ k: 'burst', x: o.x, y: o.y, r: o.r * 2, d: 0.3, color: o.color }); }
-    G.eprojs.length = 0;
-    R.picks++; R.why = 'boss';
-    heal(P.maxLife * 0.3);
-  }
-}
-function pickUp(d, quiet) {
-  const pl = G.player;
-  if (d.gold) { S.gold += d.gold; if (!quiet) addText(pl.x, pl.y - 26, '+' + d.gold, '#ffd84a'); return true; }
-  if (d.gem) { S.gems.push(d.gem); R.gems++; UI.toast('Gem found: ' + SKILLS[d.gem.id].name, '#58d8c8'); UI.onLoot('gem'); return true; }
-  if (d.item.rarity < S.opts.autoSell) { const v = itemValue(d.item); S.gold += v; if (!quiet) addText(pl.x, pl.y - 26, '+' + v, '#ffd84a'); return true; }
-  if (S.inv.length < INV_SIZE) {
-    S.inv.push(d.item); R.items++;
-    if (d.item.rarity >= 2) UI.toast(d.item.name, RARITY_COLOR[d.item.rarity]);
-    UI.onLoot(); return true;
-  }
-  if (quiet) { S.gold += itemValue(d.item); return true; }   // bag full on the way out: sold instead of lost
-  return false;
-}
-function damagePlayer(amt, type) {
-  const pl = G.player;
-  if (G.dead || pl.blink > 0 || pl.hurt > 0) return;
-  if (Math.random() * 100 < P.dodge) { addText(pl.x, pl.y - 18, 'Dodge', '#9fe6a0'); return; }
-  if (type === 'phys') amt *= 1 - Math.min(0.8, P.armour / (P.armour + 8 * amt));
-  else amt *= 1 - (P.res[type] || 0) / 100;
-  pl.life -= amt; pl.flash = 0.15; pl.hurt = 0.18; G.shake = Math.min(8, G.shake + 3 + amt / P.maxLife * 20);
-  addText(pl.x, pl.y - 18, String(Math.max(1, Math.round(amt))), '#ff6a5c');
-  if (pl.life <= 0) { pl.life = 0; G.dead = true; S.stats.deaths++; input.x = input.y = 0; endRun(false); }
-}
-
-/* ===== player skills ===== */
-function castSkill(info) {
-  const pl = G.player, d = info.def, sa = Math.sqrt(info.area);
-  switch (d.kind) {
-    case 'arc': {
-      // a full-strength sweep up close, and a weaker wave that carries the cut further
-      const R0 = d.range * sa, t = nearestMob(pl.x, pl.y, 260 * sa); if (!t) return false;
-      const ang = Math.atan2(t.y - pl.y, t.x - pl.x), hit = []; pl.face = ang;
-      for (const m of mobsInRange(pl.x, pl.y, R0)) {
-        let da = Math.abs(Math.atan2(m.y - pl.y, m.x - pl.x) - ang); if (da > Math.PI) da = Math.PI * 2 - da;
-        if (da < 1.25 || dist2(pl.x, pl.y, m.x, m.y) < (m.r + 16) * (m.r + 16)) { hitMob(m, info); hit.push(m); }
-      }
-      addFx({ k: 'arc', x: pl.x, y: pl.y, r: R0, a: ang, d: 0.18, color: d.color, follow: true });
-      const wi = Object.assign({}, info, { dmg: { phys: info.dmg.phys * 0.6, fire: info.dmg.fire * 0.6, cold: info.dmg.cold * 0.6, light: info.dmg.light * 0.6 } });
-      G.projs.push({ x: pl.x, y: pl.y, vx: Math.cos(ang) * 380, vy: Math.sin(ang) * 380, r: 14, life: 0.7 * sa, info: wi, pierce: 99, chain: 0, hit, color: d.color, kind: 'wave' });
-      return true;
-    }
-    case 'bolt': case 'lance': {
-      const t = nearestMob(pl.x, pl.y, 900); if (!t) return false;
-      const ang = Math.atan2(t.y - pl.y, t.x - pl.x); pl.face = ang;
-      const n = 1 + info.proj, spd = d.kind === 'lance' ? 440 : 340;
-      for (let i = 0; i < n; i++) {
-        const a = ang + (i - (n - 1) / 2) * 0.2;
-        G.projs.push({ x: pl.x, y: pl.y, vx: Math.cos(a) * spd, vy: Math.sin(a) * spd, r: d.kind === 'lance' ? 5 : 6, life: 2.2, info, pierce: info.pierce, chain: info.chain, hit: [], color: d.color, kind: d.kind });
-      }
-      return true;
-    }
-    case 'nova': {
-      const R0 = d.range * sa; if (!nearestMob(pl.x, pl.y, R0)) return false;
-      for (const m of mobsInRange(pl.x, pl.y, R0)) hitMob(m, info);
-      addFx({ k: 'ring', x: pl.x, y: pl.y, r: R0, d: 0.3, color: d.color, fill: true });
-      return true;
-    }
-    case 'chain': {
-      let t = nearestMob(pl.x, pl.y, d.range * 1.5); if (!t) return false;
-      pl.face = Math.atan2(t.y - pl.y, t.x - pl.x);
-      const hit = [], pts = [{ x: pl.x, y: pl.y }];
-      for (let i = 0; i <= info.chain && t; i++) { hit.push(t); pts.push({ x: t.x, y: t.y }); hitMob(t, info); t = nearestMob(t.x, t.y, 160, hit); }
-      addFx({ k: 'bolt', pts, d: 0.16, color: d.color });
-      return true;
-    }
-    case 'blink': {
-      const c = mobsInRange(pl.x, pl.y, d.range).filter(m => los(pl.x, pl.y, m.x, m.y, true)); if (!c.length) return false;
-      const t = pick(c), ang = Math.atan2(t.y - pl.y, t.x - pl.x), ox = pl.x, oy = pl.y;
-      let nx = t.x - Math.cos(ang) * (t.r + PLAYER_R + 2), ny = t.y - Math.sin(ang) * (t.r + PLAYER_R + 2);
-      if (!free(nx, ny, PLAYER_R)) { nx = ox; ny = oy; }
-      pl.x = nx; pl.y = ny; pl.face = ang; pl.blink = 0.15;
-      const R0 = 46 * sa;
-      for (const m of mobsInRange(pl.x, pl.y, R0)) hitMob(m, info, m === t ? 1 : 0.6);
-      addFx({ k: 'trail', x: ox, y: oy, x2: pl.x, y2: pl.y, d: 0.22, color: d.color });
-      addFx({ k: 'ring', x: pl.x, y: pl.y, r: R0, d: 0.2, color: d.color, fill: true });
-      return true;
-    }
-    case 'meteor': {
-      const c = mobsInRange(pl.x, pl.y, d.range * 1.4).filter(m => los(pl.x, pl.y, m.x, m.y)); if (!c.length) return false;
-      const t = pick(c), x = t.x, y = t.y, R0 = 72 * sa, room = G;
-      addFx({ k: 'warn', x, y, r: R0, d: 0.7, color: d.color });
-      G.delayed.push({ t: 0.7, fn() { if (G !== room) return; for (const m of mobsInRange(x, y, R0)) hitMob(m, info); addFx({ k: 'ring', x, y, r: R0 * 1.15, d: 0.35, color: '#ffb060', fill: true }); G.shake = Math.min(8, G.shake + 2.5); } });
-      return true;
-    }
-  }
-  return false;
-}
-function orbitBlades(info) {
-  const n = info.def.blades + info.proj, R0 = info.def.range * Math.sqrt(info.area), out = [];
-  for (let k = 0; k < n; k++) { const a = G.t * 3.4 + k * Math.PI * 2 / n; out.push({ x: G.player.x + Math.cos(a) * R0, y: G.player.y + Math.sin(a) * R0, a }); }
-  return out;
-}
-function updateOrbit(info) {
-  const bl = orbitBlades(info), pl = G.player, reach = info.def.range * Math.sqrt(info.area) + 50;
-  for (const m of G.mobs) {
-    if (m.dead || G.t < m.orbT || dist2(pl.x, pl.y, m.x, m.y) > reach * reach) continue;
-    const inside = dist2(pl.x, pl.y, m.x, m.y) < (reach - 42 + m.r) * (reach - 42 + m.r);
-    if (inside || bl.some(b => dist2(b.x, b.y, m.x, m.y) < (m.r + 13) * (m.r + 13))) { hitMob(m, info); m.orbT = G.t + info.cd; }
-  }
-}
-
-/* ===== monsters ===== */
-const EL_COLOR = { fire: '#ff7a3c', cold: '#8fd8ff', light: '#f7f08a', phys: '#c9b8a0' };
-function shoot(m, ang, spd, dmg, r) {
-  const el = G.zi.el;
-  G.eprojs.push({ x: m.x + Math.cos(ang) * m.r * 0.8, y: m.y + Math.sin(ang) * m.r * 0.8, vx: Math.cos(ang) * spd, vy: Math.sin(ang) * spd, r: r || 6, life: 5, dmg, el, color: EL_COLOR[el] });
-}
-function fan(m, n, spread, spd, dmg) { const a = Math.atan2(G.player.y - m.y, G.player.x - m.x); for (let i = 0; i < n; i++) shoot(m, a + (i - (n - 1) / 2) * spread, spd, dmg); }
-function ring(m, n, off, spd, dmg) { for (let i = 0; i < n; i++) shoot(m, off + i * Math.PI * 2 / n, spd, dmg); }
-function dashStep(m, dt, speed) {
-  const moved = moveEnt(m, Math.cos(m.ang) * speed * dt, Math.sin(m.ang) * speed * dt, m.r);
-  const pl = G.player;
-  if (!m.dashHit && dist2(m.x, m.y, pl.x, pl.y) < (m.r + PLAYER_R) * (m.r + PLAYER_R)) { m.dashHit = true; damagePlayer(m.dmg * 1.3, 'phys'); }
-  return moved;
-}
-function updateMob(m, dt) {
-  const pl = G.player, dx = pl.x - m.x, dy = pl.y - m.y, d = Math.hypot(dx, dy) || 1, ux = dx / d, uy = dy / d;
-  const slow = m.chill > 0 ? 0.65 : 1, sp = m.spd * slow * dt;
-  m.atkT -= dt * slow; m.wob += dt * 6;
-  const contact = () => { if (d < m.r + PLAYER_R + 4 && m.atkT <= 0) { m.atkT = 1.1; m.lunge = 0.18; damagePlayer(m.dmg, 'phys'); } };
-  if (m.boss) { updateBoss(m, dt, d, sp); return; }
-  if (m.totem) {
-    if (m.atkT <= 0 && los(m.x, m.y, pl.x, pl.y)) {
-      m.atkT = 2.8; m.n = (m.n || 0) + 1;
-      if (m.n % 2) ring(m, 8, m.wob, 120, m.dmg * 0.8); else fan(m, 3, 0.28, 150, m.dmg);
-    }
-    return;
-  }
-  if (m.charge) {
-    m.stT -= dt * slow;
-    if (m.st === 'walk') {
-      chase(m, sp); contact();
-      if (m.stT <= 0 && d < 360 && los(m.x, m.y, pl.x, pl.y, true)) { m.st = 'aim'; m.stT = 0.65; m.ang = Math.atan2(dy, dx); addFx({ k: 'line', x: m.x, y: m.y, a: m.ang, len: 300, w: m.r * 2, d: 0.65, color: '#ff5a3a' }); }
-    } else if (m.st === 'aim') { if (m.stT <= 0) { m.st = 'dash'; m.stT = 0.6; m.dashHit = false; } }
-    else if (m.st === 'dash') { if (!dashStep(m, dt, 360) || m.stT <= 0) { m.st = 'rest'; m.stT = 0.6; } }
-    else if (m.st === 'rest' && m.stT <= 0) { m.st = 'walk'; m.stT = rnd(2.2, 3.4); }
-    return;
-  }
-  if (m.ranged) {
-    const sees = los(m.x, m.y, pl.x, pl.y);
-    if (!sees || d > 250) chase(m, sp);
-    else if (d < 150) moveEnt(m, -ux * sp * 0.8, -uy * sp * 0.8, m.r);
-    else moveEnt(m, -uy * sp * 0.5 * Math.sin(m.wob * 0.2), ux * sp * 0.5 * Math.sin(m.wob * 0.2), m.r);
-    if (m.atkT <= 0 && sees && d < 420) { m.atkT = 2.2; shoot(m, Math.atan2(dy, dx), 165, m.dmg); m.lunge = 0.15; }
-    return;
-  }
-  if (d > m.r + PLAYER_R + 2) chase(m, sp);
-  contact();
-}
-// bosses cycle through their attack patterns
-function updateBoss(m, dt, d, sp) {
-  const pl = G.player, fin = m.final, bd = m.dmg * 0.5;
-  m.stT -= dt;
-  if (m.st === 'idle') {
-    if (d > m.r + PLAYER_R + 6) chase(m, sp * 0.8);
-    if (d < m.r + PLAYER_R + 6 && m.atkT <= 0) { m.atkT = 1.2; m.lunge = 0.2; damagePlayer(m.dmg, 'phys'); }
-    if (m.stT <= 0) {
-      m.st = m.pats[m.pi % m.pats.length]; m.pi++; m.n = 0; m.emitT = 0;
-      if (m.st === 'ring') m.stT = fin ? 0.8 : 0.4;
-      if (m.st === 'fan') m.stT = fin ? 1.0 : 0.7;
-      if (m.st === 'spiral') { m.stT = 2.2; m.ang = rnd(0, 6.28); }
-      if (m.st === 'dash') { m.stT = fin ? 0.65 : 0.8; m.ang = Math.atan2(pl.y - m.y, pl.x - m.x); addFx({ k: 'line', x: m.x, y: m.y, a: m.ang, len: 520, w: m.r * 2, d: m.stT, color: '#ff3a2a' }); }
-      if (m.st === 'summon') m.stT = 0.3;
-    }
-    return;
-  }
-  m.emitT -= dt;
-  if (m.st === 'ring') {
-    if (m.emitT <= 0 && m.n < (fin ? 2 : 1)) { m.emitT = 0.35; ring(m, fin ? 18 : 14, m.n * 0.17 + m.wob, 125, bd); m.n++; addFx({ k: 'ring', x: m.x, y: m.y, r: 60, d: 0.3, color: EL_COLOR[G.zi.el] }); }
-  } else if (m.st === 'fan') {
-    if (m.emitT <= 0 && m.n < (fin ? 3 : 2)) { m.emitT = 0.32; fan(m, 5, 0.22, 165, bd); m.n++; }
-  } else if (m.st === 'spiral') {
-    if (m.emitT <= 0) { m.emitT = fin ? 0.07 : 0.09; m.ang += 0.32; shoot(m, m.ang, 130, bd * 0.8); shoot(m, m.ang + Math.PI, 130, bd * 0.8); }
-  } else if (m.st === 'dash') {
-    if (m.n === 0 && m.stT <= 0) { m.n = 1; m.stT = 0.7; m.dashHit = false; }
-    else if (m.n === 1) { if (!dashStep(m, dt, fin ? 470 : 430) && m.stT < 0.6) m.stT = 0; }
-  } else if (m.st === 'summon') {
-    if (m.n === 0) { m.n = 1; const alive = G.mobs.filter(o => !o.boss && !o.dead).length; for (let k = 0; k < Math.min(3, 8 - alive); k++) spawnMob({ type: 'swarm', x: m.x + rnd(-40, 40), y: m.y + rnd(-40, 40) }); addFx({ k: 'ring', x: m.x, y: m.y, r: 70, d: 0.4, color: '#9fe66a', fill: true }); }
-  }
-  if (m.stT <= 0 && !(m.st === 'dash' && m.n === 0)) { m.st = 'idle'; m.stT = fin ? 1.1 : 1.5; }
-}
-
-/* ===== main update ===== */
-function update(dt) {
-  if (!G || G.dead || !R || R.over) return;
-  const pl = G.player;
-  G.t += dt;
-  let ix = input.x, iy = input.y; const il = Math.hypot(ix, iy);
-  if (il > 1) { ix /= il; iy /= il; }
-  const moving = il > 0.1;
-  moveEnt(pl, ix * P.speed * dt, iy * P.speed * dt, PLAYER_R);
-  if (moving) { pl.walk += dt * Math.min(1, il); if (G.t - pl.castT > 0.3) pl.face = Math.atan2(iy, ix); }
-  pl.life = Math.min(P.maxLife, pl.life + P.regen * dt);
-  if (pl.flash > 0) pl.flash -= dt;
-  if (pl.blink > 0) pl.blink -= dt;
-  if (pl.hurt > 0) pl.hurt -= dt;
-  if (G.shake > 0) G.shake = Math.max(0, G.shake - dt * 22);
-  G.flowT -= dt;
-  if (G.flowT <= 0) { G.flowT = 0.25; updateFlow(); }
-  const awake = G.t > 0.8;   // monsters fade in at the start of a room before they act
-
-  // skills reload all the time but only fire while the player stands still; orbiting blades never stop
-  for (let i = 0; i < 4; i++) {
-    const info = P.skills[i]; if (!info) continue;
-    if (info.def.kind === 'orbit') { if (awake) updateOrbit(info); continue; }
-    if (G.cds[i] > 0) G.cds[i] -= dt;
-    if (G.cds[i] <= 0 && !moving && awake) {
-      if (castSkill(info)) {
-        G.cds[i] = info.cd; pl.castT = G.t;
-        const room = G;
-        for (let e = 1; e <= info.echo; e++) G.delayed.push({ t: 0.2 * e, fn() { if (G === room) castSkill(info); } });
-      } else G.cds[i] = 0.06;
-    }
-  }
-  for (let i = G.delayed.length - 1; i >= 0; i--) { const d = G.delayed[i]; d.t -= dt; if (d.t <= 0) { G.delayed.splice(i, 1); d.fn(); } }
-
-  // player projectiles
-  for (let i = G.projs.length - 1; i >= 0; i--) {
-    const p = G.projs[i]; p.x += p.vx * dt; p.y += p.vy * dt; p.life -= dt;
-    let gone = p.life <= 0;
-    if (!gone && solid(p.x, p.y)) { gone = true; addFx({ k: 'burst', x: p.x, y: p.y, r: 10, d: 0.15, color: p.color }); }
-    if (!gone) for (const m of G.mobs) {
-      if (m.dead || p.hit.includes(m) || dist2(p.x, p.y, m.x, m.y) > (m.r + p.r) * (m.r + p.r)) continue;
-      p.hit.push(m); hitMob(m, p.info);
-      addFx({ k: 'burst', x: p.x, y: p.y, r: 12, d: 0.15, color: p.color });
-      if (p.chain > 0) {
-        const t = nearestMob(p.x, p.y, 200, p.hit);
-        if (t) { const sp = Math.hypot(p.vx, p.vy), a = Math.atan2(t.y - p.y, t.x - p.x); p.vx = Math.cos(a) * sp; p.vy = Math.sin(a) * sp; p.chain--; p.life = Math.max(p.life, 0.8); break; }
-      }
-      if (p.pierce > 0) { p.pierce--; continue; }
-      gone = true; break;
-    }
-    if (gone) G.projs.splice(i, 1);
-  }
-  // enemy projectiles
-  for (let i = G.eprojs.length - 1; i >= 0; i--) {
-    const p = G.eprojs[i]; p.x += p.vx * dt; p.y += p.vy * dt; p.life -= dt;
-    if (p.life <= 0 || solid(p.x, p.y)) { G.eprojs.splice(i, 1); continue; }
-    if (dist2(p.x, p.y, pl.x, pl.y) < (PLAYER_R + p.r - 2) * (PLAYER_R + p.r - 2)) { damagePlayer(p.dmg, p.el); G.eprojs.splice(i, 1); if (G.dead) return; }
-  }
-
-  // monsters
-  for (const m of G.mobs) {
-    if (m.dead) continue;
-    if (m.flash > 0) m.flash -= dt;
-    if (m.burnT > 0) { m.burnT -= dt; damageMob(m, m.burn * dt, false, true); if (m.dead) continue; if (m.burnT <= 0) m.burn = 0; }
-    if (!awake) continue;
-    if (m.lunge > 0) m.lunge -= dt;
-    if (m.chill > 0) m.chill -= dt;
-    updateMob(m, dt);
-    if (G.dead) return;
-  }
-  // keep monsters from stacking on top of each other
-  const ms = G.mobs;
-  for (let i = 0; i < ms.length; i++) {
-    const a = ms[i]; if (a.dead || a.totem) continue;
-    for (let j = i + 1; j < ms.length; j++) {
-      const b = ms[j]; if (b.dead) continue;
-      const dx = b.x - a.x, dy = b.y - a.y, rr = a.r + b.r;
-      const d2 = dx * dx + dy * dy;
-      if (d2 >= rr * rr || d2 === 0) continue;
-      const d = Math.sqrt(d2), push = (rr - d) / 2, nx = dx / d, ny = dy / d;
-      const wa = a.boss ? 0 : b.boss || b.totem ? 2 : 1, wb = b.boss || b.totem ? 0 : a.boss ? 2 : 1;
-      moveEnt(a, -nx * push * wa, -ny * push * wa, a.r); moveEnt(b, nx * push * wb, ny * push * wb, b.r);
-    }
-  }
-  for (let i = ms.length - 1; i >= 0; i--) if (ms[i].dead) ms.splice(i, 1);
-
-  // room cleared: the door opens and all loot flies to the player
-  if (!G.cleared && !ms.length) {
-    G.cleared = true; G.grid[G.door] = 1; G.eprojs.length = 0;
-    addFx({ k: 'ring', x: (G.door + 0.5) * TILE, y: TILE * 0.5, r: 70, d: 0.6, color: '#9fe6ff', fill: true });
-    UI.onClear();
-  }
-  for (let i = G.drops.length - 1; i >= 0; i--) {
-    const d = G.drops[i]; d.t += dt;
-    const dd = Math.sqrt(dist2(d.x, d.y, pl.x, pl.y));
-    if ((G.cleared && d.t > 0.4) || (d.gold && dd < 130 && d.t > 0.25)) {
-      const sp = (G.cleared ? 520 : 320) * dt / Math.max(dd, 1);
-      d.x += (pl.x - d.x) * Math.min(1, sp); d.y += (pl.y - d.y) * Math.min(1, sp);
-    }
-    if (dd < (d.gold ? 18 : P.pickup) && d.t > 0.3) {
-      if (pickUp(d)) G.drops.splice(i, 1);
-      else if (!d.warned || G.t - d.warned > 4) { d.warned = G.t; UI.toast('Inventory is full', '#ff8a7a'); }
-    }
-  }
-  if (G.drops.length > 120) G.drops.splice(0, G.drops.length - 120);
-  if (G.cleared && !R.picks && pl.y < TILE * 0.9 && Math.abs(pl.x - (G.door + 0.5) * TILE) < TILE) { nextRoom(); return; }
-
-  for (let i = G.fx.length - 1; i >= 0; i--) { const f = G.fx[i]; f.t += dt; if (f.follow) { f.x = pl.x; f.y = pl.y; } if (f.t >= f.d) G.fx.splice(i, 1); }
-  for (let i = G.texts.length - 1; i >= 0; i--) { const t = G.texts[i]; t.t += dt; t.y -= 34 * dt; if (t.t > 0.8) G.texts.splice(i, 1); }
-  if (statsDirty) computeStats();
-}
-
-/* ===== inventory / gem actions (used by the UI) ===== */
 function equipItem(it) {
-  let slot = it.slot;
-  if (slot === 'ring') slot = !S.equip.ring1 ? 'ring1' : !S.equip.ring2 ? 'ring2' : (itemScore(S.equip.ring1) <= itemScore(S.equip.ring2) ? 'ring1' : 'ring2');
-  const i = S.inv.indexOf(it); if (i < 0) return;
-  const old = S.equip[slot];
-  if (old) S.inv[i] = old; else S.inv.splice(i, 1);
-  S.equip[slot] = it;
-  computeStats(); save();
+  const slot = it.slot === 'ring1' || it.slot === 'ring2' ? (CH.equip.ring1 && !CH.equip.ring2 ? 'ring2' : CH.equip.ring1 && CH.equip.ring2 && CH.equip.ring1 !== it.id ? (it._target || 'ring1') : 'ring1') : it.slot;
+  const old = equipped(slot); if (old) { old.gem = null && 0; }
+  if (old && old.gem) { /* gems of the swapped item return to the bag (Doplněná rozhodnutí) */ old.gem = null; }
+  CH.equip[slot] = it.id;
+  if (slot === 'weapon') { const off = equipped('offhand'); if (off && canEquip(off)) { delete CH.equip.offhand; } }
+  save();
 }
-function unequip(slot) {
-  const it = S.equip[slot]; if (!it || S.inv.length >= INV_SIZE) return false;
-  delete S.equip[slot]; S.inv.push(it); computeStats(); save(); return true;
+function unequip(slot) { const it = equipped(slot); if (!it) return; it.gem = null; delete CH.equip[slot]; save(); }
+const isEquipped = it => Object.values(CH.equip).includes(it.id);
+function sellItem(it) { if (isEquipped(it)) return; CH.gold += sellValue(it); it.gem = null; CH.items = CH.items.filter(i => i !== it); save(); }
+function upgradeItem(it, times = 1) { let n = 0; while (n < times && it.lvl < 100) { const c = upgradeCost(it.lvl, it.rar); if (CH.gold < c) break; CH.gold -= c; it.spent += c; it.lvl++; n++; } save(); return n; }
+// ---------- gems ----------
+const gemSocketKind = slot => SLOT[slot === 'offhand' ? 'offhand' : slot].socket;
+function socketOk(it, gem) {
+  if (gem.sk) { if (it.slot === 'offhand') return it.type === 'wand'; return SLOT[it.slot].socket === 'skill'; }
+  if (it.slot === 'offhand') return it.type === 'shield'; return SLOT[it.slot].socket === 'stat';
 }
-function sellItem(it) { const i = S.inv.indexOf(it); if (i < 0) return; S.inv.splice(i, 1); S.gold += itemValue(it); }
-function sellBelow(rarity) { let n = 0; for (const it of S.inv.slice()) if (it.rarity <= rarity) { sellItem(it); n++; } save(); return n; }
-function socketGem(slot, gemId) {
-  const g = gemById(gemId); if (!g) return;
-  const prev = gemSocketed(gemId);
-  if (prev) S.slots[prev.slot].skill = null;
-  S.slots[slot].skill = gemId;
-  computeStats(); save();
+function socketGem(it, gem) { for (const i of CH.items) if (i.gem === gem.id) i.gem = null; it.gem = gem.id; save(); }
+const gemInUse = g => CH.items.some(i => i.gem === g.id);
+function slotUnlocked(slot) {
+  const L = CH.lvl;
+  if (slot === 'weapon') return true;
+  if (slot === 'offhand') { const it = equipped('offhand'); return offhandUnlocked() && (!it || it.type === 'wand' || L >= STAT_SOCKET_LEVEL); }
+  if (slot === 'body') return L >= 10; if (slot === 'boots') return L >= 25; if (slot === 'helmet') return L >= 40; if (slot === 'gloves') return CH.runsDone >= 50;
+  return L >= STAT_SOCKET_LEVEL;
 }
-function unsocket(slot) { S.slots[slot].skill = null; computeStats(); save(); }
-function buyGem(i) {
-  const o = S.shop[i]; if (!o || S.gold < o.price) return false;
-  S.gold -= o.price; S.gems.push(o.gem); S.shop.splice(i, 1); save(); return true;
+function slotUnlockText(slot) { return { body: 'level 10', boots: 'level 25', helmet: 'level 40', gloves: '50 dokončených runů', offhand: 'Dual Mastery ve stromu' }[slot] || 'level 30'; }
+
+// ---------- tree (Schéma 13) ----------
+const TREE_ADJ = (() => { const a = TREE_DATA.nodes.map(() => []); for (const [x, y] of TREE_DATA.edges) { a[x].push(y); a[y].push(x); } return a; })();
+const treePoints = () => CH.lvl < 5 ? 0 : 5 + (CH.lvl - 5);
+const treeFree = () => treePoints() - (CH.tree.length - 1);
+function canAlloc(n) { return !CH.tree.includes(n) && treeFree() > 0 && TREE_ADJ[n].some(m => CH.tree.includes(m)); }
+function allocNode(n) { if (!canAlloc(n)) return false; CH.tree.push(n); const nd = TREE_DATA.nodes[n]; if (nd[4] === 'gem') { const id = gemIdByName(nd[6]); if (id && !CH.gems.some(g => g.sk === id && g.tree)) CH.gems.push({ id: uid(), sk: id, tree: n }); } save(); return true; }
+function canRefund(n) { if (n === 0 || !CH.tree.includes(n)) return false; const rest = new Set(CH.tree.filter(x => x !== n)); const seen = new Set([0]), q = [0]; while (q.length) { const c = q.pop(); for (const m of TREE_ADJ[c]) if (rest.has(m) && !seen.has(m)) { seen.add(m); q.push(m); } } return seen.size === rest.size; }
+const refundCost = () => 50 + CH.lvl * 20;
+function refundNode(n) { if (!canRefund(n) || CH.gold < refundCost()) return false; CH.gold -= refundCost(); CH.tree = CH.tree.filter(x => x !== n); const g = CH.gems.find(g => g.tree === n); if (g) { for (const i of CH.items) if (i.gem === g.id) i.gem = null; CH.gems = CH.gems.filter(x => x !== g); } if (TREE_DATA.nodes[n][4] === 'offhand' && !offhandUnlocked()) delete CH.equip.offhand; save(); return true; }
+const gemIdByName = name => Object.keys(SKILLS).find(k => SKILLS[k].name === name);
+
+// ---------- derived stats ----------
+function computeStats(c = CH) {
+  const t = {}; const keys = {};
+  for (const n of c.tree) { const nd = TREE_DATA.nodes[n]; if (!nd) continue; for (const k in nd[7]) t[k] = (t[k] || 0) + nd[7][k]; if (nd[4] === 'keystone') keys[nd[6]] = 1; }
+  const eq = s => c.equip[s] ? c.items.find(i => i.id === c.equip[s]) : null;
+  const w = eq('weapon'), wt = w ? WEAPONS[w.type] : WEAPONS.sword, el = wt.el;
+  let dmg = 0, hp = 100 + 8 * (c.lvl - 1), armour = 0, as = 0, redP = 0, greenP = 0, yellow = 0;
+  for (const s of SLOTS) { const it = eq(s); if (!it) continue; if (s === 'offhand' && !offhandUnlockedC(c)) continue; const v = itemStat(it); if (v.k === 'dmg') dmg += v.v; else if (v.k === 'hp') hp += v.v; else if (v.k === 'armour') armour += v.v; else if (v.k === 'as') as += v.v;
+    if (it.gem && SLOT[s].socket === 'stat' || it.gem && s === 'offhand' && it.type === 'shield') { const g = c.sgems.find(x => x.id === it.gem); if (g && c.lvl >= STAT_SOCKET_LEVEL) { const val = statGemValue(g, gemLevelFromItem(it.lvl)); if (g.col === 'red' || g.col === 'white') redP += val; if (g.col === 'green' || g.col === 'white') greenP += val; if (g.col === 'yellow' || g.col === 'white') yellow += g.col === 'white' ? val * 0.45 : val; } } }
+  if (!w) dmg = 5;
+  hp *= (1 + ((t.lifePct || 0) + greenP) / 100) * (keys['Pact of Rot'] ? 0.8 : 1);
+  armour *= (1 + (t.armourPct || 0) / 100) * (keys.Unbreakable ? 1.4 : 1);
+  as += (t.atkSpeed || 0) + (t.castSpeed || 0) + yellow - (keys.Unbreakable ? 15 : 0);
+  dmg *= 1 + redP / 100;
+  // rotation: gems in unlocked sockets that match the weapon element
+  const rot = {}, gemLvl = {};
+  for (const s of ROTATION) { const it = eq(s); if (!it || !it.gem) continue; const g = c.gems.find(x => x.id === it.gem); if (!g) continue; const sk = SKILLS[g.sk]; if (!sk || sk.el !== el) continue;
+    if (s === 'offhand' && !(it.type === 'wand' && offhandUnlockedC(c))) continue; if (!slotUnlockedC(c, s)) continue; if (sk.group === 'jen se štítem' && !(eq('offhand') && eq('offhand').type === 'shield')) {}
+    rot[s] = { id: g.sk, lvl: gemLevelFromItem(it.lvl) }; gemLvl[g.sk] = rot[s].lvl; }
+  const sh = eq('offhand');
+  return { el, melee: !!wt.melee, weaponType: w ? w.type : 'sword', dmg, hp: Math.round(hp), armour, as, crit: 5 + (t.crit || 0), critMulti: 150 + (t.critMulti || 0), dodge: Math.min(40, t.dodge || 0), t, keys, rot, gemLvl,
+    shield: !!(sh && sh.type === 'shield' && offhandUnlockedC(c)), offWand: !!(sh && sh.type === 'wand' && offhandUnlockedC(c)) };
 }
-function sellGem(id) {
-  const g = gemById(id); if (!g || gemSocketed(id)) return false;
-  S.gems.splice(S.gems.indexOf(g), 1); S.gold += 25 + g.lvl * 10; save(); return true;
+const offhandUnlockedC = c => c.tree.some(n => TREE_DATA.nodes[n] && TREE_DATA.nodes[n][4] === 'offhand');
+function slotUnlockedC(c, s) { const o = CH; CH = c; const r = slotUnlocked(s); CH = o; return r; }
+const power = st => Math.round(st.dmg * 3 + st.hp / 4 + st.armour / 2);
+
+// ---------- energy, keys, daily resets ----------
+function tickTimers() {
+  if (!CH) return; const now = Date.now();
+  if (CH.energy < TOWER.maxEnergy) { const n = Math.floor((now - CH.energyT) / (TOWER.regenMin * 60000)); if (n > 0) { CH.energy = Math.min(TOWER.maxEnergy, CH.energy + n); CH.energyT += n * TOWER.regenMin * 60000; } } else CH.energyT = now;
+  if (CH.keyDay !== today()) { CH.keyDay = today(); CH.keys += WB_KEYS_PER_DAY; }
+  if (CH.wb.day !== today()) { CH.wb.day = today(); CH.wb.dmg = 0; CH.wb.claimed = 0; CH.wb.killed = 0; }
+  if (CH.wb.week !== weekId()) { CH.wb.week = weekId(); CH.wb.weekKills = [0, 0, 0, 0]; CH.wb.weekLoot = [0, 1, 2, 3].map(() => ({ g: 0, d: 0 })); CH.wb.weekDays = [[], [], [], []]; }
+  if (!CH.shop || CH.shop.day !== today()) rollShop();
 }
-function canAllocate(id) {
-  const n = TREE.nodes[id];
-  return !!n && !S.tree.includes(id) && passivePoints() > 0 && n.adj.some(a => S.tree.includes(a));
+
+// ---------- level (Schéma 6, 11) ----------
+function addCharXp(v) {
+  const ups = []; if (CH.lvl >= 100) return ups; CH.xp += v;
+  while (CH.lvl < 100 && CH.xp >= xpToNext(CH.lvl)) { CH.xp -= xpToNext(CH.lvl); CH.lvl++; const r = levelReward(CH.lvl); grantLevelReward(r); ups.push({ lvl: CH.lvl, r }); }
+  return ups;
 }
-function allocate(id) { if (!canAllocate(id)) return false; S.tree.push(id); computeStats(); save(); return true; }
-const respecCost = () => (S.tree.length - 1) * 12 * Math.max(1, Math.floor(S.level / 5));
-function respec() { const c = respecCost(); if (S.gold < c || S.tree.length <= 1) return false; S.gold -= c; S.tree = ['start']; computeStats(); save(); return true; }
+function grantLevelReward(r) {
+  if (r.kind === 'gold') CH.gold += r.n; else if (r.kind === 'energy') CH.energy = Math.min(TOWER.maxEnergy * 2, CH.energy + r.n); else if (r.kind === 'diamonds') CH.dia += r.n; else if (r.kind === 'key') CH.keys += r.n;
+  else if (r.kind === 'gem') { const g = rollSkillGem(rnd() < 0.4 ? computeStats().el : null); CH.gems.push(g); r.gem = g.sk; }
+}
+function rollSkillGem(el) {
+  if (!el) { const st = computeStats(); const others = ELS.filter(e => e !== st.el); el = rnd() < 0.4 ? st.el : pick(others); }
+  const tier = gemsUnlockedTier(CH.zoneReached); const pool = Object.values(SKILLS).filter(s => s.el === el && !s.ex && s.tier <= tier);
+  return { id: uid(), sk: pick(pool).id };
+}
+
+// ---------- shop (Schéma 12) ----------
+const fitRunGold = () => BASE_RUN_XP * fitChapterMult(CH.lvl);
+function rollShop() {
+  const items = []; for (let i = 0; i < 4; i++) { const slots = SLOTS.filter(s => s !== 'offhand' || offhandUnlocked()); const it = makeItem(pick(slots), rnd() < 0.15 ? 3 : 2); it.price = Math.round(fitRunGold() * (it.rar === 3 ? SHOP.uniqueRuns : SHOP.rareRuns)); items.push(it); }
+  const gems = [0, 1].map(() => { const g = rollSkillGem(); g.price = Math.round(fitRunGold() * SHOP.gemRuns); return g; });
+  CH.shop = { day: today(), items, gems, bought: [] };
+}
+function buyShop(kind, i) { const sh = CH.shop, x = kind === 'item' ? sh.items[i] : sh.gems[i]; if (!x || x.sold || CH.gold < x.price) return false; CH.gold -= x.price; x.sold = 1; if (kind === 'item') { const it = Object.assign({}, x); delete it.price; delete it.sold; it.id = uid(); CH.items.push(it); } else CH.gems.push({ id: uid(), sk: x.sk }); save(); return true; }
+function buyChest(el) { if (CH.dia < SHOP.chest) return null; CH.dia -= SHOP.chest; const g = rollSkillGem(el); CH.gems.push(g); save(); return g; }
+function refreshShop() { if (CH.dia < SHOP.refresh) return false; CH.dia -= SHOP.refresh; rollShop(); save(); return true; }
+
+// ---------- stat gem merging (Schéma 8) ----------
+function mergeGems(gs) {
+  if (gs.length !== 3) return null; const tier = Math.min(...gs.map(g => g.tier)); const cost = mergeCost(tier); if (CH.gold < cost) return null;
+  const cols = gs.map(g => g.col), cnt = {}; cols.forEach(c => cnt[c] = (cnt[c] || 0) + 1);
+  let col; if (cnt.white === 3) col = 'white'; else { const colored = cols.filter(c => c !== 'white'); const c2 = {}; colored.forEach(c => c2[c] = (c2[c] || 0) + 1); const maj = Object.keys(c2).find(k => c2[k] >= 2); col = maj || (colored.length === 2 && cnt.white === 1 && colored[0] === colored[1] ? colored[0] : (Object.keys(c2).length === 1 && colored.length ? colored[0] : pick(['red', 'green', 'yellow']))); }
+  let q = gs.reduce((a, g) => a + (g.q || 0), 0) / 3; let nt = tier + 1; if (gs.every(g => g.tier === 15)) { nt = 15; q = Math.min(20, q + 1); }
+  CH.gold -= cost; for (const g of gs) { for (const i of CH.items) if (i.gem === g.id) i.gem = null; } CH.sgems = CH.sgems.filter(g => !gs.includes(g));
+  const ng = { id: uid(), col, tier: Math.min(15, nt), q: Math.round(q * 10) / 10 }; CH.sgems.push(ng); save(); return ng;
+}
+const newStatGem = (tier, white) => ({ id: uid(), col: white ? 'white' : pick(['red', 'green', 'yellow']), tier, q: Math.round((1 + rnd() * 19) * 10) / 10 });
+
+// ================= sessions =================
+// RS: { kind, ch, diff, room, stage, sxp, picks, hp, sup, gold, xp, dia, items:[], kills, done, ... }
+function sessionStats() { const st = computeStats(); if (RS && RS.insane) st.hp = 1; return st; }
+function startRun(ch, diff) {
+  RS = { kind: 'run', ch, diff, room: 1, stage: 1, sxp: 0, picks: 1, hp: null, sup: {}, gold: 0, xp: 0, xpRooms: 0, dia: 0, items: [], kills: 0, insane: diff === 2, seed: (Math.random() * 1e9) | 0, res: null };
+  MODE = 'run'; RUN.sup = RS.sup; enterRoom(); save();
+}
+function roomKind(r) { return TRADER_ROOMS.includes(r) ? 'trader' : ELITE_ROOMS.includes(r) ? 'elite' : BOSS_ROOMS.includes(r) ? 'boss' : 'normal'; }
+const zoneEnemyPool = z => [['minion', 'minion', 'archer', 'swarm', 'warrior'], ['minion', 'archer', 'mage', 'rogue', 'warrior', 'swarm'], ['minion', 'mage', 'rogue', 'warrior', 'totem', 'archer'], ['warrior', 'mage', 'rogue', 'totem', 'archer', 'minion'], ['warrior', 'mage', 'rogue', 'totem', 'archer', 'swarm']][z];
+const BOSS_PATS = [[['fan', 'slam', 'summon'], ['ring', 'slam', 'dash', 'summon']], [['fan', 'dash', 'summon', 'slam'], ['ring', 'spiral', 'slam', 'summon']], [['fan', 'ring', 'dash', 'pools'], ['spiral', 'slam', 'pools', 'summon', 'ring']],
+  [['ring', 'dash', 'anvils', 'summon'], ['spiral', 'anvils', 'dash', 'summon', 'fan']], [['spiral', 'fan', 'pools', 'dash'], ['ring', 'spiral', 'anvils', 'firering', 'summon', 'dash']]];
+function enterRoom() {
+  const r = RS.room, kind = roomKind(r), z = zoneOf(RS.ch), st = sessionStats();
+  const room = genRoom(RS.seed + r * 7919, kind === 'boss' ? 'boss' : kind === 'trader' ? 'trader' : 'normal');
+  newArena({ mode: 'run', room, zone: z, mlvl: monsterLevel(RS.ch, RS.diff, r), stats: st, hp: RS.hp == null ? st.hp : Math.min(RS.hp, st.hp), res: RS.res, onClear: roomCleared });
+  G.kind = kind;
+  if (kind === 'trader') { G.started = true; G.clear = true; G.doorOpen = true; room.open = true; G.trader = !RS.traded; }
+  else if (kind === 'boss') {
+    const B = r === 50 ? ZONES[z].boss : ZONES[z].mini, res = {}; const pct = zoneResPct(z); for (const e of B.res) res[e] = -pct; res[B.vuln] = pct;
+    const e = spawnEnemy('warrior', 11, 9, { boss: true, hpMult: r === 50 ? 26 : 16, dmgMult: 1.4, model: B.model, tint: B.tint, scale: r === 50 ? 2 : 1.6, name: B.name, res, pat: BOSS_PATS[z][r === 50 ? 1 : 0] });
+    e.r = r === 50 ? 1.3 : 1.05; e.spd = 2.6; G.boss = e; G.started = true;
+  } else spawnPack(kind, z);
+  G.started = true;
+  if (RS.picks > 0) UI.showPick();
+}
+function spawnPack(kind, z) {
+  const pool = zoneEnemyPool(z), spots = floorSpots(G.room, 3, 24); let budget = 3.4 + RS.room * 0.07 + z * 0.4 + (kind === 'elite' ? 2.5 : 0);
+  const tint = ZONES[z].tint;
+  for (let guard = 0; budget > 0.5 && guard < 40 && spots.length; guard++) {
+    const type = pick(pool), d = ENEMY[type], [x, zz] = spots.splice(Math.floor(rnd() * spots.length), 1)[0];
+    const rare = kind === 'elite' ? (rnd() < 0.2 ? 2 : rnd() < 0.6 ? 1 : 0) : (rnd() < 0.08 + z * 0.01 ? 1 : 0);
+    if (type === 'swarm') { for (let i = 0; i < 3; i++) spawnEnemy('swarm', x + (i - 1) * 0.8, zz + (i % 2) * 0.6, { tint }); budget -= d.cost * 3 * 0.6; continue; }
+    spawnEnemy(type, x, zz, { rare, tint }); budget -= d.cost * [1, 2, 3][rare];
+  }
+}
+function roomCleared() {
+  if (MODE !== 'run') return sessionCleared();
+  const kind = G.kind, m = chapterMult(RS.ch, RS.diff), r = RS.room;
+  if (kind === 'trader') return;
+  const k = kind === 'elite' ? 'elite' : kind === 'boss' ? (r === 50 ? 'boss50' : 'boss25') : 'normal';
+  RS.xp += ROOM_XP[k] * m; RS.gold += Math.round(ROOM_GOLD[k] * (1 + 0.1 * (RS.ch - 1)) * [1, 1.5, 2][RS.diff]);
+  if (kind === 'elite') dropItem(false);
+  if (kind === 'boss') { const z = zoneOf(RS.ch), dv = DIAMONDS_BOSS[z][RS.diff]; RS.dia += r === 50 ? dv : Math.round(dv / 2); dropItem(true); if (r === 50) dropItem(true); if (r === 25) { stageUp(); } }
+  RS.cleared = r;
+}
+function dropItem(boss) {
+  const slots = SLOTS.filter(s => s !== 'offhand' || offhandUnlocked()); const slot = pick(slots); const rar = rollRarity(RS.ch, RS.diff, boss);
+  let type = null; if (slot === 'weapon') { const st = computeStats(); type = rnd() < 0.5 ? st.weaponType : null; } if (slot === 'offhand') type = equipped('weapon') && equipped('weapon').type === 'wand' ? 'wand' : 'shield';
+  const it = makeItem(slot, rar, type); RS.items.push(it); if (G) { G.loot.push({ x: G.P.x, z: G.P.z - 2, rar, t: 0 }); pushWord(G.P.x, G.P.z, RARITY[rar].name + ' předmět', RARITY[rar].col); }
+}
+function sessionKill(e) {
+  if (!RS) return; RS.kills++;
+  if (MODE === 'run' && !e.boss && rnd() < 0.015) dropItem(false);
+  if (MODE === 'wb' && e.add && G.P.cursed > 0) G.P.cursed = 0;
+}
+const goldPerOrb = () => MODE === 'run' ? (1 + 0.1 * (RS.ch - 1)) * [1, 1.5, 2][RS.diff] * 1.2 : 0;
+function sessionXp(v) {
+  if (!RS) return; const max = 15;
+  if (RS.stage >= max) { heal(G.P.max * 0.02 * v); RS.xp += v * 2; return; }
+  RS.sxp += v * (MODE === 'tower' ? 3.2 : 1);
+  while (RS.stage < max && RS.sxp >= stageNeed(RS.stage)) { RS.sxp -= stageNeed(RS.stage); stageUp(); }
+}
+function stageUp() { if (RS.stage >= 15) return; RS.stage++; RS.picks++; if (UI.onStage) UI.onStage(); }
+// support choices: 3 random, each must help at least one equipped skill gem (Schéma 3, 5)
+function rollSupports() {
+  const st = computeStats(), skills = Object.values(st.rot).map(r => r.id);
+  const pool = Object.values(SUPPORTS).filter(s => s.gems.some(g => skills.includes(g))).filter(s => { const q = RS.sup[s.id]; return !q || (!q.gone && !q.corr && q.lvl < 5); });
+  const out = []; while (out.length < 3 && pool.length) out.push(pool.splice(Math.floor(rnd() * pool.length), 1)[0].id); return out;
+}
+function takeSupport(id) { const q = RS.sup[id]; if (q) q.lvl++; else RS.sup[id] = { lvl: 1 }; RS.picks--; save(); }
+function takeHealInstead() { RS.picks--; if (G) heal(G.P.max * 0.3); }
+// trader (Schéma 4): heal or corrupt one support
+function traderHeal() { RS.traded = true; heal(G.P.max); G.trader = false; save(); }
+function traderCorrupt(id) { const q = RS.sup[id]; RS.traded = true; G.trader = false; const r = rnd(); let res;
+  if (r < 0.6) { q.fx = true; res = 'fx'; } else if (r < 0.85) { q.lvl += 2; res = 'lvl'; } else { q.gone = true; res = 'gone'; } q.corr = true; q.lvl = Math.min(q.lvl, 7); save(); return res; }
+function nextRoom() {
+  if (MODE !== 'run') return;
+  RS.hp = G.P.hp; RS.res = { rage: G.P.rage, heat: G.P.heat, crystals: G.P.crystals, essence: G.P.essence };
+  if (RS.room >= ROOMS) return endSession(true);
+  RS.room++; RS.traded = false; enterRoom(); save();
+}
+// ---------- tower (Schéma 8) ----------
+function towerUnlocked() { return CH.lvl >= TOWER.unlock; }
+function towerDiffOpen(d) { return d === 0 || CH.tower.best[d - 1] >= 5; }
+function startTower(diff, floor) {
+  tickTimers(); if (CH.energy < TOWER.cost[diff]) return false; CH.energy -= TOWER.cost[diff];
+  RS = { kind: 'tower', diff, floor, stage: 5, sxp: 0, picks: 5, sup: {}, gold: 0, xp: 0, dia: 0, items: [], sgems: [], kills: 0, insane: diff === 2, t: 0, bossUp: false };
+  MODE = 'tower'; RUN.sup = RS.sup; const st = sessionStats();
+  newArena({ mode: 'tower', room: genRoom((Math.random() * 1e9) | 0, 'arena'), zone: Math.min(4, 2 + diff), mlvl: towerMonsterLevel(diff, floor), stats: st, onClear: sessionCleared });
+  G.kind = 'arena'; G.started = false; G.room.open = false; G.spawnT = 1; UI.showPick(); save(); return true;
+}
+function towerTick(dt) {
+  if (MODE !== 'tower' || !G || G.P.dead) return; RS.t += dt;
+  if (!RS.bossUp) {
+    G.spawnT -= dt; if (G.spawnT <= 0 && alive().length < 14) { G.spawnT = 1.6 - Math.min(0.9, RS.t / 300); const pool = zoneEnemyPool(Math.min(4, 2 + RS.diff)); const a = rnd() * 6.28, rr = 5 + rnd() * 3; const x = clamp(G.P.x + Math.sin(a) * rr, 3, 19), z = clamp(G.P.z + Math.cos(a) * rr, 3, 35); if (canStand(G.room, x, z, 0.6)) spawnEnemy(pick(pool), x, z, { rare: rnd() < 0.08 ? 1 : 0 }); }
+    if (RS.t >= TOWER.arena) { RS.bossUp = true; for (const e of G.ents) if (!e.dead) { e.dead = true; e.deadT = 0.3; } const B = ZONES[Math.min(4, 2 + RS.diff)].boss; G.started = true; const e = spawnEnemy('warrior', 11, 10, { boss: true, hpMult: 22, dmgMult: 1.3, model: B.model, tint: B.tint, scale: 1.8, name: 'Strážce patra ' + RS.floor, pat: BOSS_PATS[Math.min(4, 2 + RS.diff)][1] }); e.r = 1.2; G.boss = e; }
+  }
+}
+// ---------- world boss (Schéma 14) ----------
+const wbToday = () => WB_BOSSES[new Date().getDay()];
+function wbTierOpen(t) { return CH.lvl >= WB_TIERS[t].level && (t === 0 || CH.wb.tierBest >= t - 1); }
+const wbBossHp = t => monHp(50) * 90 * WB_TIERS[t].hp * (wbToday().hp || 1);
+function startWB(tier) {
+  tickTimers(); if (CH.keys <= 0 || !wbTierOpen(tier)) return false; CH.keys--;
+  if (CH.wb.wbTier !== tier) { CH.wb.wbTier = tier; CH.wb.dmg = 0; CH.wb.claimed = 0; CH.wb.killed = 0; }
+  RS = { kind: 'wb', tier, stage: 15, sxp: 0, picks: 15, sup: {}, gold: 0, xp: 0, dia: 0, items: [], sgems: [], gems: [], kills: 0, t: 0, startDmg: CH.wb.dmg };
+  MODE = 'wb'; RUN.sup = RS.sup; const st = sessionStats(), B = wbToday();
+  newArena({ mode: 'wb', room: genRoom(4242, 'arena'), zone: 4, mlvl: 50, stats: st, onClear: sessionCleared });
+  G.kind = 'wb'; G.started = true;
+  const e = spawnEnemy('warrior', 11, 10, { boss: true, hpMult: 1, model: B.model, tint: B.tint, scale: 2.2, name: B.name, pat: B.mech.concat(['fan', 'ring']), dmgMult: WB_TIERS[tier].dmg * 0.55 });
+  e.max = e.hp = wbBossHp(tier); e.hp = Math.max(1, e.max - CH.wb.dmg); e.enrage = true; e.r = 1.4; G.boss = e; G.mlvl = 50;
+  UI.showPick(); save(); return true;
+}
+function wbTick(dt) { if (MODE !== 'wb' || !G) return; RS.t += dt; if (RS.t >= WB_TIME && !G.P.dead && !G.clear) { G.P.dead = true; G.timeUp = true; } }
+function wbClaim() {
+  // milestones reached by the summed damage of both daily attempts
+  const tier = CH.wb.wbTier, T = WB_TIERS[tier], max = wbBossHp(tier), frac = CH.wb.dmg / max, got = [];
+  const goldLvl = 2 * upgradeCost(CH.lvl, 0) * T.gold * (wbToday().reward || 1);
+  const give = (i, mult) => { const g = Math.round(goldLvl * WB_GOLD_SHARE[i] * mult), d = Math.round(T.dia[i] * mult * (wbToday().reward || 1)); CH.gold += g; CH.dia += d; CH.wb.weekLoot[tier].g += g; CH.wb.weekLoot[tier].d += d; got.push({ g, d });
+    if (i === 1) { const sg = newStatGem(clamp(1 + Math.floor(rnd() * 3) + tier * 3, 1, 15)); CH.sgems.push(sg); got[got.length - 1].sg = sg; }
+    if (i === 2) { const gm = rollSkillGem(pick(ELS)); CH.gems.push(gm); got[got.length - 1].gem = gm.sk; }
+    if (i === 4) { const it = makeItem(pick(SLOTS.filter(s => s !== 'offhand' || offhandUnlocked())), T.item); CH.items.push(it); got[got.length - 1].item = it; } };
+  for (let i = 0; i < 5; i++) if (frac >= WB_MILES[i] && !(CH.wb.claimed & (1 << i))) { CH.wb.claimed |= 1 << i; give(i, 1); }
+  const killed = frac >= 0.9999 && !CH.wb.killed;
+  if (killed) { CH.wb.killed = 1; for (let i = 0; i < 5; i++) give(i, 1); CH.wb.tierBest = Math.max(CH.wb.tierBest, tier);
+    const day = new Date().getDay(); CH.wb.weekDays = CH.wb.weekDays || [[], [], [], []]; if (!CH.wb.weekDays[tier].includes(day)) CH.wb.weekDays[tier].push(day);
+    if (CH.wb.weekDays[tier].length >= 7) { const L = CH.wb.weekLoot[tier]; CH.gold += L.g; CH.dia += L.d; got.push({ week: true, g: L.g, d: L.d }); } }
+  return { got, killed, frac };
+}
+
+// ---------- ending a session ----------
+function sessionCleared() {
+  if (MODE === 'tower' && G.boss && G.boss.dead) {
+    const d = towerDrop(RS.diff, RS.floor), n = rnd() < d.second ? 2 : 1;
+    for (let i = 0; i < n; i++) RS.sgems.push(newStatGem(d.tier, rnd() < d.white));
+    RS.gold += 500; RS.dia += towerDiamonds(RS.diff, RS.floor); RS.xp += BASE_RUN_XP * fitChapterMult(CH.lvl) / 10; RS.won = true;
+    setTimeout0(1.2, () => endSession(true));
+  }
+  if (MODE === 'wb' && G.boss && G.boss.dead) setTimeout0(1.2, () => endSession(true));
+}
+function endSession(won) {
+  const res = { kind: RS.kind, won, gold: RS.gold, xp: 0, dia: RS.dia, items: RS.items.slice(), sgems: (RS.sgems || []).slice(), ups: [], extra: null };
+  if (RS.kind === 'run') {
+    let xp = RS.xp; if (CH.lvl >= 90 && !won) xp = 0; res.xp = Math.round(xp);
+    if (won) { CH.runsDone++; const key = RS.ch + ':' + RS.diff; CH.prog.cleared[key] = (CH.prog.cleared[key] || 0) + 1;
+      if (RS.diff === 0 && RS.ch >= CH.prog.maxCh[0] && RS.ch < 20) CH.prog.maxCh[0] = RS.ch + 1;
+      if (zoneOf(RS.ch) >= 2) { if (RS.diff < 2) { const nd = RS.diff + 1; CH.prog.hcOpen = CH.prog.hcOpen || {}; CH.prog.hcOpen[RS.ch + ':' + nd] = 1; } if (RS.diff > 0 && RS.ch % 4 !== 0) CH.prog.hcOpen[(RS.ch + 1) + ':' + RS.diff] = 1; }
+      CH.zoneReached = Math.max(CH.zoneReached, zoneOf(Math.min(20, RS.ch + 1)) + 1);
+    } else if (RS.diff > 0) { res.extra = 'Smrt na ' + DIFFS[RS.diff] + ': postup v zóně se vrací na první kapitolu.'; const z0 = zoneOf(RS.ch) * 4 + 1; for (let c = z0 + 1; c <= z0 + 3; c++) if (CH.prog.hcOpen) delete CH.prog.hcOpen[c + ':' + RS.diff]; }
+    CH.zoneReached = Math.max(CH.zoneReached, zoneOf(RS.ch) + 1);
+  } else if (RS.kind === 'tower') {
+    res.xp = Math.round(RS.xp);
+    if (won) { CH.tower.best[RS.diff] = Math.max(CH.tower.best[RS.diff], RS.floor); CH.tower.floor[RS.diff] = Math.max(CH.tower.floor[RS.diff], Math.min(25, RS.floor + 1)); }
+    else { CH.energy = Math.max(0, CH.energy - TOWER.cost[RS.diff]); if (RS.diff > 0) { CH.tower.floor[RS.diff] = 1; res.extra = 'Smrt na ' + DIFFS[RS.diff] + ': věž se vrací na 1. patro.'; } }
+  } else if (RS.kind === 'wb') {
+    const add = Math.max(0, G.bossDmg || 0); CH.wb.dmg = Math.min(wbBossHp(RS.tier), CH.wb.dmg + add); res.wbDmg = add; res.wb = wbClaim();
+  }
+  CH.gold += res.gold; CH.dia += res.dia;
+  for (const it of res.items) { if (S.set.autoSell && it.rar < S.set.autoSell) { CH.gold += sellValue(it); it.sold = 1; } else CH.items.push(it); }
+  for (const g of res.sgems) CH.sgems.push(g);
+  res.ups = addCharXp(res.xp);
+  RS = null; MODE = 'menu'; RUN.sup = {}; G = null; save();
+  UI.showEnd(res);
+}
+function abandonSession() { if (!RS) return; if (RS.kind === 'run') endSession(false); else { if (G) G.P.dead = true; endSession(false); } }
+function resumeSession() {
+  const s = CH && CH.session; if (!s) return false; RS = s; RUN.sup = RS.sup; MODE = RS.kind;
+  if (RS.kind === 'run') { enterRoom(); return true; }
+  RS = null; MODE = 'menu'; CH.session = null; save(); return false;   // tower / world boss attempts are not resumable
+}
+// chapters open for play
+function chapterOpen(ch, diff) { if (diff === 0) return ch <= CH.prog.maxCh[0]; if (zoneOf(ch) < 2) return false; if (ch % 4 === 1 && CH.prog.cleared[(ch) + ':' + (diff - 1)]) return true; return !!(CH.prog.hcOpen && CH.prog.hcOpen[ch + ':' + diff]); }
+
+// ---------- main loop hooks ----------
+function gameStep(dt) {
+  if (!G || MODE === 'menu') return;
+  if (UI.paused()) return;
+  arenaStep(dt); if (!G) return; towerTick(dt); wbTick(dt); if (!G) return;
+  if (G.P.dead && !G.endT) { G.endT = 1.4; }
+  if (G.endT) { G.endT -= dt; if (G.endT <= 0) { const won = MODE === 'wb' && G.timeUp ? false : false; endSession(won); return; } }
+  // leaving through the door
+  if (MODE === 'run' && G.clear && !G.trader && G.P.z < 2.6 && Math.abs(G.P.x - (DOOR_X + 0.5) * T) < 1.8) nextRoom();
+}

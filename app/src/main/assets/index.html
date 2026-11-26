@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="en">
+<html lang="cs">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
@@ -9,52 +9,31 @@
 </head>
 <body>
 <canvas id="cv"></canvas>
-
+<canvas id="ov"></canvas>
 <div id="hud" class="hidden">
-  <div id="top">
-    <div id="zonebox">
-      <div id="zname"></div>
-      <div class="bar" id="zbar"><i></i><span id="ztxt"></span></div>
-      <div id="zinfo"></div>
-      <div id="abil"></div>
-    </div>
-    <div id="gold"></div>
+  <div id="htop">
+    <div id="hroom"></div>
+    <div id="hstage"><b id="hsn"></b><div class="bar"><i id="hsbar"></i></div></div>
+    <button id="hpause" aria-label="Pauza">❚❚</button>
   </div>
-  <div id="bossbar" class="hidden"><div id="bname"></div><div class="bar"><i></i></div></div>
-  <div id="btns">
-    <button data-p="auto" aria-label="Pause and menu">❚❚<b data-dot="any"></b></button>
-  </div>
-  <div id="toasts"></div>
-  <div id="bottom">
-    <div id="orb"><i id="orbfill"></i><span id="orbtxt"></span></div>
-    <div id="skills"></div>
-    <div id="lvl"></div>
-  </div>
-  <div id="xpbar"><i></i></div>
+  <div id="hres"></div>
+  <div id="hboss" class="hidden"><div id="hbname"></div><div class="bar big"><i id="hbbar"></i></div><div id="hbinfo"></div></div>
+  <div id="hrot"></div>
+  <div id="hjoy"><i></i></div>
 </div>
-
-<div id="panel" class="hidden">
-  <div id="phead">
-    <div id="tabs">
-      <button data-p="inv">Items</button>
-      <button data-p="gems">Skills</button>
-      <button data-p="tree">Passives</button>
-      <button data-p="menu">Menu</button>
-    </div>
-    <button id="pclose" aria-label="Close">✕</button>
-  </div>
-  <div id="pbody"></div>
-  <div id="sheet" class="hidden"></div>
-</div>
-
-<div id="overlay" class="hidden"></div>
-
+<div id="ui"></div>
+<div id="ovl" class="hidden"></div>
+<div id="toast"></div>
+<script src="js/models.js"></script>
 <script src="js/data.js"></script>
-<script src="js/tree.js"></script>
+<script src="js/treedata.js"></script>
+<script src="js/engine3d.js"></script>
 <script src="js/room.js"></script>
+<script src="js/combat.js"></script>
+<script src="js/skills.js"></script>
+<script src="js/arena.js"></script>
 <script src="js/game.js"></script>
 <script src="js/render.js"></script>
-<script src="js/model.js"></script>
 <script src="js/ui.js"></script>
 </body>
 </html>
